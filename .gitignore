@@ -1,0 +1,33 @@
+# ─── credentials ──────────────────────────────────────────────────────────────
+# token.csv holds live OAuth tokens. Never commit it. Start from
+# token.example.csv instead, which is tracked on purpose.
+token.csv
+token.csv.bak
+*.csv
+!token.example.csv
+
+# Backups this tool writes next to a shell rc it edits (they contain a token).
+*.claude_token_rotate.bak
+*.claude_token_rotate.orig
+
+# Local state: cap cache, auto-rotate setting, SHA-256 token digests.
+.claude_token_rotate.json
+
+# ─── build output ─────────────────────────────────────────────────────────────
+# `./build.sh` recreates all of this; the binary alone is ~11 MB.
+claude-token-rotate
+dist/
+.build/
+*.spec
+
+# ─── python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ─── editors / os ─────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
