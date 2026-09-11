@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Freeze claude_token_rotate.py into a single executable that needs no Python on the target machine.
+# Freeze main.py into a single executable that needs no Python on the target machine.
 #
-# WHY THIS IS CHEAP HERE. claude_token_rotate.py imports nothing outside the standard library, so there is
+# WHY THIS IS CHEAP HERE. main.py imports nothing outside the standard library, so there is
 # no dependency graph to get wrong and no C extension to compile — the whole job is stapling a
 # CPython runtime to one file. That is also why the result stays around 11 MB instead of the
 # hundreds a scientific stack would drag in.
@@ -9,8 +9,8 @@
 # WHAT YOU GET
 #   dist/claude-token-rotate          one file; run it anywhere with a compatible libc
 #
-# The binary looks for token.csv and writes .claude_token_rotate.json BESIDE ITSELF, not
-# beside wherever you invoked it from — see app_dir() in claude_token_rotate.py. Symlinking it onto PATH
+# The binary looks for token.csv and writes data.json BESIDE ITSELF, not
+# beside wherever you invoked it from — see app_dir() in main.py. Symlinking it onto PATH
 # works: sys.executable is already resolved, so the CSV stays next to the real file.
 #
 # PORTABILITY. The build is per-platform and per-libc: a Linux binary does not run on macOS, and a
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")"
-SRC=claude_token_rotate.py
+SRC=main.py
 NAME=claude-token-rotate
 VENV=.build/venv
 MODE=${1:-onefile}
