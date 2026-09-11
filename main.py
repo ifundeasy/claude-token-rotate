@@ -68,24 +68,24 @@ that matter. `t` offers to run `claude daemon stop --any` for you; auto-rotate n
 stopping the supervisor terminates live sessions and a timer should not make that call.
 
 Tokens are never printed: the table shows a redacted form, and copy actions put the full value on
-the clipboard. Every write to the CSV leaves a `.bak` beside it first. A `.claude_token_rotate.json`
+the clipboard. Every write to the CSV leaves a `.bak` beside it first. A `data.json`
 appears beside the script holding SHA-256 prefixes — never tokens — of which credentials /usage
 refused, plus the last cap it reported, so a relaunch does not re-ask a settled question against a
 rate-limited endpoint. Deleting it costs one extra round of requests, nothing else.
 
 USAGE
-    python3 claude_token_rotate.py                             # live dashboard
-    python3 claude_token_rotate.py --interval 300              # cheaper for leaving open
-    python3 claude_token_rotate.py --view o                    # extra credits, cap auto-detected
-    python3 claude_token_rotate.py --view o --cap 5            # override the cap by hand
-    python3 claude_token_rotate.py --only alice,bob            # watch a subset
-    python3 claude_token_rotate.py --alert 80                  # bell when a window crosses 80%
-    python3 claude_token_rotate.py --log usage.csv             # append every reading for later analysis
-    python3 claude_token_rotate.py --once --json               # one machine-readable snapshot
-    python3 claude_token_rotate.py --auto-rotate                # swap credentials at 75% unattended
-    python3 claude_token_rotate.py --rotate-at 60 --env-file ~/.bashrc
-    python3 claude_token_rotate.py --no-env-write               # never touch a shell file
-    python3 claude_token_rotate.py --from-env ../outline-audit/.env
+    python3 main.py                             # live dashboard
+    python3 main.py --interval 300              # cheaper for leaving open
+    python3 main.py --view o                    # extra credits, cap auto-detected
+    python3 main.py --view o --cap 5            # override the cap by hand
+    python3 main.py --only alice,bob            # watch a subset
+    python3 main.py --alert 80                  # bell when a window crosses 80%
+    python3 main.py --log usage.csv             # append every reading for later analysis
+    python3 main.py --once --json               # one machine-readable snapshot
+    python3 main.py --auto-rotate                # swap credentials at 75% unattended
+    python3 main.py --rotate-at 60 --env-file ~/.bashrc
+    python3 main.py --no-env-write               # never touch a shell file
+    python3 main.py --from-env ../outline-audit/.env
 
 KEYS
     views    h 5h    w 7d    o overage    b all
@@ -568,7 +568,7 @@ def app_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-STATE_PATH = os.path.join(app_dir(), ".claude_token_rotate.json")
+STATE_PATH = os.path.join(app_dir(), "data.json")
 SCOPE_TTL = 7 * 86400                   # how long "this token cannot read /usage" is believed
 
 

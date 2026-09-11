@@ -46,10 +46,10 @@ ratio rather than measured.
 ## Run it
 
 ```bash
-python3 claude_token_rotate.py                 # live dashboard
-python3 claude_token_rotate.py --once          # one snapshot, then exit
-python3 claude_token_rotate.py --once --json   # machine-readable
-python3 claude_token_rotate.py --interval 300  # cheaper if you leave it open
+python3 main.py                 # live dashboard
+python3 main.py --once          # one snapshot, then exit
+python3 main.py --once --json   # machine-readable
+python3 main.py --interval 300  # cheaper if you leave it open
 ```
 
 `token.csv` sits beside the script. Start from the example:
@@ -126,7 +126,7 @@ would not be enough to recover the original.
 elsewhere:
 
 ```bash
-python3 claude_token_rotate.py --env-file ~/.bashrc
+python3 main.py --env-file ~/.bashrc
 ```
 
 ### Safeguards
@@ -235,7 +235,7 @@ To keep using the Python script instead:
 
 ```bash
 # ~/.zshrc or ~/.bashrc
-alias ctr='python3 /path/to/claude-token-rotate/claude_token_rotate.py'
+alias ctr='python3 /path/to/claude-token-rotate/main.py'
 ```
 
 ---
@@ -267,7 +267,7 @@ alias ctr='python3 /path/to/claude-token-rotate/claude_token_rotate.py'
 | File | When |
 |---|---|
 | `token.csv` (+ `.bak`) | on `a` / `d` / `e` |
-| `.claude_token_rotate.json` | cap cache and auto-swap setting (SHA-256 prefixes, **not** tokens) |
+| `data.json` | cap cache and auto-swap setting (SHA-256 prefixes, **not** tokens) |
 | `~/.zshenv` (+ `.claude_token_rotate.bak`, `.claude_token_rotate.orig`) | on `t` / `z` / auto-swap |
 | `dist/`, `.build/` | only on `./build.sh` |
 | `~/.claude/settings.json` | only if you install the statusline yourself |
