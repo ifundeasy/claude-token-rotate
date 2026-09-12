@@ -758,6 +758,18 @@ ENV_MAX_BYTES = 256 * 1024
 #: is "what did this file look like before this tool ever touched it" — and only the second one
 #: survives auto-rotate, which can write several times an hour and would roll `.bak` away.
 ENV_BAK, ENV_ORIG = ".claude_token_rotate.bak", ".claude_token_rotate.orig"
+#: An explicit `unset`, which is what actually switches the variable OFF.
+#:
+#: Commenting the export out only removes the ASSIGNMENT — it cannot remove an INHERITANCE. A
+#: desktop session freezes the variable into its own environment at login and hands it to every
+#: terminal it spawns, so a shell that merely skips the export still starts with the old value
+#: already in place. Measured on a GNOME session: 127 processes, gnome-shell and the systemd user
+#: manager among them, still carried a token that had been "disabled" in the file hours earlier.
+#: `unset` is the only line that clears what the parent already set.
+UNSET_RE = re.compile(r"^(?P<indent>[ \t]*)unset[ \t]+" + re.escape(TOKEN_COL)
+                      + r"(?P<tail>[ \t]*(?:\#.*)?)$")   # a trailing comment still counts
+UNSET_NOTE = "  # claude-token-rotate: clears any value inherited from the desktop session"
+
 #: Any mention of the variable, parseable or not. Appending a second assignment while an
 #: unparseable one already exists would silently create two sources of truth.
 ENV_MENTION = re.compile(r"\b" + re.escape(TOKEN_COL) + r"\b")
@@ -804,16 +816,22 @@ def env_state(path: str, store: "Store | None" = None) -> dict[str, object]:
 
     live: list[int] = []
     dead: list[int] = []
+    unsets: list[int] = []
     for i, ln in enumerate(lines):
         m = EXPORT_RE.match(ln)
         if m:
             (dead if m.group("hash") else live).append(i)
+        elif UNSET_RE.match(ln):
+            unsets.append(i)
+    out["unsets"] = unsets
     out["ambiguous"] = len(live) > 1
     idx = live[-1] if live else (dead[-1] if dead else -1)
     if idx < 0:
         return out
     m = EXPORT_RE.match(lines[idx])
-    out["idx"], out["active"] = idx, not m.group("hash")
+    # An export that a later `unset` undoes is not active, whatever the line itself says.
+    out["idx"] = idx
+    out["active"] = bool(not m.group("hash") and not any(u > idx for u in unsets))
     out["token"] = unquote(m.group("val"))
     if store is not None and out["token"]:
         known = getattr(store, "all_rows", None) or store.rows
@@ -880,6 +898,9 @@ def env_set(path: str, store: "Store", token: str) -> str:
         i = int(st["idx"])
         indent = EXPORT_RE.match(lines[i]).group("indent") or ""
         lines[i] = indent + assign                      # keeps indentation, drops any comment mark
+        # Any `unset` left over from a disable would silently undo the line we just wrote.
+        for u in sorted((x for x in st.get("unsets") or [] if x > i), reverse=True):
+            del lines[u]
     else:
         if st.get("mentions"):
             raise RuntimeError(f"{os.path.basename(path)} mentions {TOKEN_COL} in a form this "
@@ -893,10 +914,13 @@ def env_set(path: str, store: "Store", token: str) -> str:
 
 
 def env_toggle(path: str) -> tuple[str, bool]:
-    """Comment the export line out, or bring it back. The value is never discarded.
+    """Switch the variable off or back on. The value is never discarded.
 
-    Commenting is what the line's own documentation calls rolling back, and it keeps the token
-    recoverable — deleting the line would make re-enabling a retyping exercise.
+    Off is TWO edits, not one: the export is commented out so the value survives for later, and an
+    explicit `unset` is written after it. The second is what actually does the work — commenting
+    the export only stops this file from setting the variable, and a shell started by a desktop
+    session already has it set before this file is read. Without the `unset`, "disabled" means
+    nothing in exactly the case people hit: a new terminal.
     """
     st = env_state(path)
     env_guard(st, path)
@@ -908,7 +932,16 @@ def env_toggle(path: str) -> tuple[str, bool]:
     indent = m.group("indent") or ""
     rest = lines[i][len(indent) + len(m.group("hash") or ""):]
     was_active = bool(st["active"])
-    lines[i] = indent + ("# " + rest if was_active else rest)
+    unsets = sorted(st.get("unsets") or [])
+
+    if was_active:
+        lines[i] = indent + "# " + rest.lstrip("# ").lstrip()
+        if not any(u > i for u in unsets):
+            lines.insert(i + 1, indent + f"unset {TOKEN_COL}" + UNSET_NOTE)
+    else:
+        lines[i] = indent + rest.lstrip("# ").lstrip()
+        for u in sorted((x for x in unsets if x > i), reverse=True):
+            del lines[u]
     env_write(path, lines)
     what = "disabled" if was_active else "enabled"
     return f"{TOKEN_COL} {what} in {os.path.basename(path)}", not was_active
