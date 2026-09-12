@@ -94,7 +94,7 @@ column and can change it.
 |---|---|
 | **Manual** (`t`) | pick a row, or leave blank for the freshest → confirm → write → offered `claude daemon stop --any` |
 | **Auto** (`T`) | once the live token passes `--rotate-at` (default 75% of its 5h window), a fresher credential is swapped in |
-| **Off** (`z`) | comments the `export` line out without discarding the value; press again to re-enable |
+| **Off** (`z`) | comments the `export` line out *and* writes an explicit `unset`; press again to re-enable |
 
 Auto mode **never** touches the supervisor. Stopping it terminates live sessions — that is a
 decision a person makes, not a timer.
@@ -105,6 +105,24 @@ decision a person makes, not a timer.
 and the Claude Code supervisor hands its own credential to every background session it owns. Until
 that supervisor restarts, the swap is invisible to exactly the sessions that matter. That is why
 `t` offers to run `claude daemon stop --any`.
+
+**Switching off writes `unset`, not just a `#`.** Commenting the export out removes the assignment
+but cannot remove an *inheritance*. A desktop session freezes the variable into its own environment
+at login and hands it to every terminal it spawns, so a shell that merely skips the export still
+starts with the old value already set. Measured on a GNOME session: 127 processes — `gnome-shell`
+and the systemd user manager among them — still carried a token that had been "disabled" in the
+file hours earlier, and a brand-new terminal inherited it. The explicit `unset` is what makes a new
+shell actually clean; re-enabling removes that line again so it cannot undo the export.
+
+If the variable is also in the systemd user manager, clear it there too — otherwise anything
+systemd starts keeps inheriting it:
+
+```bash
+systemctl --user unset-environment CLAUDE_CODE_OAUTH_TOKEN
+```
+
+Processes that are already running keep their copy regardless; only a restart (or a full logout)
+clears those.
 
 **Only the assignment line is rewritten.** The file is read as lines, exactly one is replaced, and
 the rest are written back untouched — so a comment block explaining why the variable is there
