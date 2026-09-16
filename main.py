@@ -91,7 +91,7 @@ KEYS
     views    h 5h    w 7d    o overage    b all
     read     r refresh now    s cycle sort    i inspect one credential's raw headers
     copy     1-9 that row's token    c any row by number    p most 5h headroom    x Markdown
-    manage   a add credential    d delete    e rename
+    manage   a add credential    d delete    e edit name and/or token
     shell    t inject into ~/.zshenv    z activate/deactivate    T auto-rotate on/off
     other    +/- interval    q quit
 """
@@ -1996,7 +1996,7 @@ def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, 
                         GREEN if on else DIM, color)]
         right = [f"{g('r')}{d(' refresh')}  {g('s')}{d(' sort')}  {g('i')}{d(' raw')}  "
                  f"{g('D')}{d(' diagnose')}  {g('+/-')}{d(' interval')}",
-                 f"{g('a')}{d(' add')}  {g('d')}{d(' delete')}  {g('e')}{d(' rename')}  "
+                 f"{g('a')}{d(' add')}  {g('d')}{d(' delete')}  {g('e')}{d(' edit')}  "
                  f"{g('q')}{d(' quit')}",
                  ""]
         # The two columns are zipped positionally, so they must be the same length; the old
@@ -2129,15 +2129,19 @@ def pick_row(keys: Keys, store: Store, rows: list[dict[str, str]], what: str) ->
     return i if 0 <= i < len(rows) else -1
 
 
-def validate_token(store: Store, token: str) -> str:
-    """Empty string when the token is usable, otherwise the reason it is not."""
+def validate_token(store: Store, token: str, skip: dict[str, str] | None = None) -> str:
+    """Empty string when the token is usable, otherwise the reason it is not.
+
+    `skip` is the row being edited: re-pasting a row's own value is a no-op, not a duplicate, and
+    reporting it as "already in the list" would be true but useless.
+    """
     if not token:
         return "no token entered"
     if any(ch.isspace() for ch in token):
         return "token contains whitespace — it was probably truncated or wrapped"
     if len(token) < 20:
         return f"token is only {len(token)} characters — that is not a full OAuth token"
-    if any(token == store.token(r) for r in store.rows):
+    if any(token == store.token(r) for r in store.rows if r is not skip):
         return "that token is already in the list"
     return ""
 
@@ -2598,18 +2602,66 @@ def main() -> int:
                     if store.readonly:
                         flash = "list is read-only (--from-env)"
                         continue
-                    i = pick_row(keys, store, rows, "rename")
+                    i = pick_row(keys, store, rows, "edit")
                     if i < 0:
-                        flash = "rename cancelled"
+                        flash = "edit cancelled"
                         continue
                     row = rows[i]
-                    old = store.name(row)
-                    new = ask(keys, f"  rename '{old}' to: ")
-                    if new:
-                        store.rows[store.rows.index(row)][store.name_col] = new
-                        flash = f"renamed '{old}' to '{new}' — {store.save()}"
-                    else:
-                        flash = "rename cancelled"
+                    old_name, old_tok = store.name(row), store.token(row)
+                    new_name = ask(keys, f"  name [{old_name}] (blank keeps it): ") or old_name
+                    new_tok = ask(keys, f"  token [{redact(old_tok)}] (blank keeps it, hidden): ",
+                                  secret=True) or old_tok
+                    if new_name == old_name and new_tok == old_tok:
+                        flash = "nothing changed"
+                        continue
+                    changed_tok = new_tok != old_tok
+                    r = None
+                    if changed_tok:
+                        why = validate_token(store, new_tok, skip=row)
+                        if why:
+                            flash = f"not changed: {why}"
+                            continue
+                        # Verify before saving, exactly as `a` does: a credential list whose rows
+                        # have never answered is worse than no list at all.
+                        r = probe(new_tok, args.timeout)
+                        p5, p7 = upct(r, "u5h"), upct(r, "u7d")
+                        verdict = (f"HTTP {r.get('code')} · 5h {p5:.0f}% · 7d {p7:.0f}%"
+                                   if p5 is not None and p7 is not None
+                                   else f"HTTP {r.get('code')} · "
+                                        f"{r.get('err', 'no quota headers')}")
+                        ok = ask(keys, f"  verified: {verdict}\n  replace the token for "
+                                       f"'{new_name}'? [y/N]: ")
+                        if not ok.lower().startswith("y"):
+                            flash = "edit cancelled"
+                            continue
+                    idx = store.rows.index(row)
+                    store.rows[idx][store.name_col] = new_name
+                    bits = []
+                    if new_name != old_name:
+                        bits.append(f"'{old_name}' → '{new_name}'")
+                    if changed_tok:
+                        store.rows[idx][store.tok_col] = new_tok
+                        # Every per-token dict describes the OLD credential. Carrying its readings
+                        # over would attach one account's history to another's row, so they are
+                        # dropped and reseeded from the probe just taken.
+                        for cache in (results, hist, marks, USAGE_OK):
+                            cache.pop(old_tok, None)
+                        if r is not None:
+                            results[new_tok] = r
+                            record({new_tok: r})
+                        bits.append(f"token → {redact(new_tok)}")
+                    flash = " · ".join(bits) + f" — {store.save()}"
+                    # A shell still exporting the replaced value now points at a credential that
+                    # is not in the list any more, which reads as "unknown token" everywhere.
+                    if changed_tok and env_ok and LIVE.get("token") == old_tok:
+                        up = ask(keys, f"  {os.path.basename(env_path)} still exports the old "
+                                       f"value — update it? [Y/n]: ")
+                        if not up.lower().startswith("n"):
+                            try:
+                                flash += " · " + env_set(env_path, store, new_tok)
+                            except (RuntimeError, OSError) as exc:
+                                flash += f" · shell file not updated: {exc}"
+                            read_live()
     except KeyboardInterrupt:
         pass
     finally:
