@@ -79,7 +79,7 @@ survive a rewrite, and rows with an empty token are skipped. Use `--csv PATH` fo
 | `h` `w` `o` `b` | view 5h / 7d / extra credits / all |
 | `r` `s` `i` `D` | refresh · cycle sort · raw headers · diagnose one credential |
 | `1-9` `c` `p` `x` | copy that row's token · copy any row by number · copy the freshest · copy the table as Markdown |
-| `a` `d` `e` | add · delete · rename a credential |
+| `a` `d` `e` | add · delete · edit a credential (name and/or token) |
 | **`t`** **`z`** **`T`** | **inject a token into your shell · activate/deactivate · auto-swap on/off** |
 | `+` `-` `q` | interval · quit |
 
