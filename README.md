@@ -93,11 +93,22 @@ column and can change it.
 | How | Behaviour |
 |---|---|
 | **Manual** (`t`) | pick a row, or leave blank for the freshest → confirm → write → offered `claude daemon stop --any` |
-| **Auto** (`T`) | once the live token passes `--rotate-at` (default 75% of its 5h window), a fresher credential is swapped in |
+| **Auto** (`T`) | once the live token passes `--rotate-at` (default 75%) on **either** its 5h or its weekly window, a fresher credential is swapped in |
 | **Off** (`z`) | comments the `export` line out *and* writes an explicit `unset`; press again to re-enable |
 
 Auto mode **never** touches the supervisor. Stopping it terminates live sessions — that is a
 decision a person makes, not a timer.
+
+**Both windows decide.** A credential at 4% of its five hours and 96% of its week is fresh by the
+five-hour number alone and refused on the next request, so the rotator ranks every row by whichever
+of its two windows is closest to its limit, and will not swap into one that is already past the
+threshold on either. When nothing qualifies it says so once and stays put rather than churning.
+
+**A switched-off variable is kept fresh, but stays off.** Writing a value and switching it on are
+separate decisions, and the second one is yours. With `z` off, auto-rotate still updates the parked
+value, so turning it back on hands you the best credential rather than whatever was there hours ago
+— but it never re-enables the line. Only `t` does that, and `t` is the deliberate override: it
+ignores the threshold and switches the variable on, saying so when that was a change.
 
 ### What you need to know
 
@@ -271,7 +282,7 @@ alias ctr='python3 /path/to/claude-token-rotate/main.py'
 | `--log CSV` | append every reading for later analysis |
 | `--cap USD\|auto\|off` | extra-credit cap; `auto` reads it from `/api/oauth/usage` |
 | `--env-file PATH` | shell file to manage (default `~/.zshenv`) |
-| `--rotate-at PCT` | auto-swap threshold (default 75) |
+| `--rotate-at PCT` | auto-swap threshold, applied to both the 5h and the weekly window (default 75) |
 | `--auto-rotate` | start with auto-swap on |
 | `--no-env-write` | never write a shell file |
 | `--diagnose NAME` | test both paths (API and `claude -p`) for one credential |
@@ -292,6 +303,20 @@ alias ctr='python3 /path/to/claude-token-rotate/main.py'
 
 Tokens are never printed: the table shows a truncated tail, and copy actions put the full value on
 the clipboard.
+
+---
+
+## Tests
+
+```bash
+python3 tests/run.py
+```
+
+Standard library only, no framework. Every case builds its own CSV and shell rc in a temp
+directory — nothing touches a real file. Shell behaviour is verified by running `zsh` with the
+variable already set in the environment, which is the only way to catch the failure the suite
+exists for: commenting an `export` out looks right in the file and does nothing to a shell that
+inherited the value from its parent.
 
 ---
 

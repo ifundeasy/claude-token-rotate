@@ -882,11 +882,17 @@ def env_guard(st: dict[str, object], path: str) -> None:
                            f"fix it by hand; guessing which one wins would be worse")
 
 
-def env_set(path: str, store: "Store", token: str) -> str:
-    """Point the shell file at `token` and make sure the line is active.
+def env_set(path: str, store: "Store", token: str, activate: bool | None = True) -> str:
+    """Point the shell file at `token`. `activate` decides whether it is also switched on.
 
-    Only the assignment changes. Any comment block explaining why the variable is there survives
-    untouched, because the surrounding lines are written back exactly as they were read.
+    Writing a value and switching the variable on are two different decisions, and conflating them
+    is how automation overrides a person. `activate=None` keeps whatever state the file is in: a
+    credential that was deliberately switched off stays off, but its value is still kept fresh, so
+    turning it back on later hands you the best token rather than a stale one. `True` is for a
+    person who explicitly asked for this token; `False` writes it parked.
+
+    Only the assignment changes either way. Any comment block explaining why the variable is there
+    survives untouched, because the surrounding lines are written back exactly as they were read.
     """
     if not token or set(token) & SHELL_UNSAFE:
         raise RuntimeError("token has characters that cannot be written to a shell file")
@@ -896,11 +902,17 @@ def env_set(path: str, store: "Store", token: str) -> str:
     assign = f'export {TOKEN_COL}="{token}"'
     if st["idx"] >= 0:
         i = int(st["idx"])
-        indent = EXPORT_RE.match(lines[i]).group("indent") or ""
-        lines[i] = indent + assign                      # keeps indentation, drops any comment mark
-        # Any `unset` left over from a disable would silently undo the line we just wrote.
-        for u in sorted((x for x in st.get("unsets") or [] if x > i), reverse=True):
-            del lines[u]
+        m = EXPORT_RE.match(lines[i])
+        indent = m.group("indent") or ""
+        on = bool(st["active"]) if activate is None else bool(activate)
+        lines[i] = indent + ("" if on else "# ") + assign
+        if on:
+            # An `unset` left over from a disable would silently undo the line just written.
+            for u in sorted((x for x in st.get("unsets") or [] if x > i), reverse=True):
+                del lines[u]
+        elif not any(x > i for x in st.get("unsets") or []):
+            # Parked, not live: the unset is what keeps an inherited value from standing in.
+            lines.insert(i + 1, indent + f"unset {TOKEN_COL}" + UNSET_NOTE)
     else:
         if st.get("mentions"):
             raise RuntimeError(f"{os.path.basename(path)} mentions {TOKEN_COL} in a form this "
@@ -966,14 +978,29 @@ def daemon_stop() -> str:
     return "supervisor stopped" if out.returncode == 0 else f"daemon stop exited {out.returncode}"
 
 
-def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
-                exclude: str = "") -> "tuple[dict[str, str], float] | None":
-    """The credential with the most 5h headroom, skipping one token and anything already refusing.
+def worst_window(r: dict[str, object]) -> float | None:
+    """How close a credential is to its nearest limit: the higher of its 5h and 7d utilization.
 
-    This is the `p` key's selector: the lowest 5h utilization among rows that are not blocked. The
-    filter matters more here than it does for a clipboard copy — a row whose state starts with
-    EXTRA, unauthorized, forbidden or rate cannot serve a request at all, so promoting it would
-    trade a busy credential for a dead one.
+    Judging on the five-hour figure alone picks a credential that is idle this hour and spent for
+    the week — fresh by the only measure being consulted, and refused on the next request.
+    Whichever window is closest to its limit is the one that decides.
+    """
+    vals = [p for p in (upct(r, "u5h"), upct(r, "u7d")) if p is not None]
+    return max(vals) if vals else None
+
+
+def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
+                exclude: str = "", ceiling: float | None = None
+                ) -> "tuple[dict[str, str], float] | None":
+    """The credential furthest from any of its limits, skipping one token and anything refusing.
+
+    Ranked on `worst_window`, so a row is only as fresh as its busiest window. `ceiling` drops
+    candidates that are already at or past the rotation threshold on either window — swapping into
+    one of those buys nothing, since it trips the same trigger on the next cycle.
+
+    The blocked filter matters more here than it does for a clipboard copy: a row whose state
+    starts with EXTRA, unauthorized, forbidden or rate cannot serve a request at all, so promoting
+    it would trade a busy credential for a dead one.
     """
     cands: list[tuple[float, dict[str, str]]] = []
     for row in rows:
@@ -983,8 +1010,8 @@ def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
         r = results.get(tok, {})
         if state_note(r).startswith(("EXTRA", "unauthorized", "forbidden", "rate")):
             continue
-        p = upct(r, "u5h")
-        if p is not None:
+        p = worst_window(r)
+        if p is not None and (ceiling is None or p < ceiling):
             cands.append((p, row))
     if not cands:
         return None
@@ -2287,6 +2314,15 @@ def main() -> int:
     def auto_swap(results: dict, rows: list[dict[str, str]]) -> str:
         """Swap in a fresher credential when the live one is spent. Returns a status line or "".
 
+        BOTH windows decide. A credential at 4% of its five hours and 96% of its week is fresh by
+        the only number this used to read, and refused on the next request; `worst_window` takes
+        whichever is closest to its limit, for the incumbent and for every candidate.
+
+        A switched-off variable is still kept fresh, but stays switched off. Writing a value and
+        turning it on are separate decisions — the second one is the user's, made with `z`, and a
+        timer does not get to reverse it. So the value is parked: when it is switched back on, the
+        best credential is already in place instead of whatever was there hours ago.
+
         Deliberately does NOT stop the Claude Code supervisor. A running supervisor keeps the
         credential it started with, so the swap only reaches processes started afterwards — but
         killing it unprompted would cut off whatever session the user is in the middle of, which
@@ -2297,35 +2333,43 @@ def main() -> int:
         if not (auto_rotate and env_ok) or LIVE.get("err") or LIVE.get("ambiguous"):
             return ""
         tok = str(LIVE.get("token") or "")
-        if not tok or not LIVE.get("active") or not LIVE.get("name"):
-            return ""                      # nothing exported, switched off, or a token we cannot judge
-        now = upct(results.get(tok, {}), "u5h")
+        if not tok or not LIVE.get("name"):
+            return ""                      # nothing written, or a token this list cannot judge
+        cur = results.get(tok, {})
+        now = worst_window(cur)
         if now is None or now < rotate_at:
             no_cand_said = False           # back under the line: allow the next warning to speak
             return ""
+        p5, p7 = upct(cur, "u5h"), upct(cur, "u7d")
+        which = "5h" if (p5 is not None and p5 >= rotate_at) else "weekly"
+        if p5 is not None and p7 is not None and p5 >= rotate_at and p7 >= rotate_at:
+            which = "5h and weekly"
         if time.time() - last_rotate < ROTATE_GAP:
             return ""
-        pick = rotate_pick(store, rows, results, exclude=tok)
-        # The replacement has to be under the line as well, or it trips the same trigger on the
-        # next cycle and the dashboard spends its life rewriting $HOME.
-        if pick is None or pick[1] >= rotate_at or pick[1] > now - ROTATE_MARGIN:
+        # `ceiling` keeps out anything already past the line on either window: swapping into one
+        # trips the same trigger next cycle and the dashboard spends its life rewriting $HOME.
+        pick = rotate_pick(store, rows, results, exclude=tok, ceiling=rotate_at)
+        if pick is None or pick[1] > now - ROTATE_MARGIN:
             if not no_cand_said:
                 no_cand_said = True
-                return (f"auto-rotate: {LIVE.get('name')} at {now:.0f}% but nothing is "
-                        f"{ROTATE_MARGIN:.0f}pp fresher — staying put")
+                return (f"auto-rotate: {LIVE.get('name')} at {now:.0f}% ({which}) but no "
+                        f"credential is under {rotate_at:.0f}% on both windows — staying put")
             return ""
         row, p = pick
-        old = LIVE.get("name")
+        old, was_on = LIVE.get("name"), bool(LIVE.get("active"))
         try:
-            env_set(env_path, store, store.token(row))
+            # activate=None: keep the file's own on/off state. Refreshing a parked value is
+            # housekeeping; switching it on would be overruling the person who parked it.
+            env_set(env_path, store, store.token(row), activate=None)
         except (RuntimeError, OSError) as exc:
             auto_rotate = False        # a failure that repeats every interval is noise, not news
             read_live()
             return f"auto-rotate OFF — write failed: {exc}"
         last_rotate, no_cand_said = time.time(), False
         read_live()
-        return (f"↻ auto-rotate: {old} {now:.0f}% → {store.name(row)} {p:.0f}% · "
-                f"restart Claude Code clients to pick it up")
+        return (f"↻ auto-rotate: {old} {now:.0f}% ({which}) → {store.name(row)} {p:.0f}% · "
+                + ("restart Claude Code clients to pick it up" if was_on
+                   else f"still switched off — z activates it"))
 
     read_live()
 
@@ -2460,17 +2504,15 @@ def main() -> int:
                     via = copy_to_clipboard(markdown(store, rows, results))
                     flash = f"table copied as Markdown via {via}" if via else "no clipboard found"
                 elif key == "p":
-                    cands = [(upct(results.get(store.token(r), {}), "u5h"), r) for r in rows
-                             if not state_note(results.get(store.token(r), {})).startswith(
-                                 ("EXTRA", "unauthorized", "forbidden", "rate"))]
-                    cands = [(p, r) for p, r in cands if p is not None]
-                    if cands:
-                        p, row = min(cands, key=lambda t: t[0])
-                        via = copy_to_clipboard(store.token(row))
-                        flash = (f"copied '{store.name(row)}' — most 5h headroom at {p:.0f}% "
-                                 f"via {via}") if via else "no clipboard found"
-                    else:
+                    pick = rotate_pick(store, rows, results)
+                    if pick is None:
                         flash = "no usable credential to pick"
+                    else:
+                        row, p = pick
+                        via = copy_to_clipboard(store.token(row))
+                        flash = (f"copied '{store.name(row)}' — furthest from any limit, "
+                                 f"{p:.0f}% on its busiest window via {via}") \
+                            if via else "no clipboard found"
                 elif key == "c" or (key.isdigit() and key != "0"):
                     # A single keypress only reaches row 9. Past that the row number has to be
                     # typed, so `c` asks for it — the list is not capped at nine credentials.
@@ -2515,13 +2557,18 @@ def main() -> int:
                     if not ok.lower().startswith("y"):
                         flash = "inject cancelled"
                         continue
+                    was_off = LIVE.get("idx", -1) >= 0 and not LIVE.get("active")
                     try:
-                        msg = env_set(env_path, store, store.token(row))
+                        # Manual inject is the deliberate override: it ignores the threshold and
+                        # it switches the variable on, which auto-rotate is not allowed to do.
+                        msg = env_set(env_path, store, store.token(row), activate=True)
                     except (RuntimeError, OSError) as exc:
                         flash = f"not written: {exc}"
                         continue
                     read_live()
                     flash = f"injected '{store.name(row)}' — {msg}"
+                    if was_off:
+                        flash += " · switched ON (it was off)"
                     stop = ask(keys, "  a running supervisor keeps its old credential — "
                                      "stop it now? [y/N]: ")
                     flash += " · " + (daemon_stop() if stop.lower().startswith("y")
