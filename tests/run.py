@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main as m                                                        # noqa: E402
@@ -164,11 +165,44 @@ def test_refusals(d: str) -> None:
           m.validate_token(store, tok("L"), skip=store.rows[0]) == "")
 
 
+def test_session_detection(d: str) -> None:
+    """Only real sessions count, and this tool must never count itself.
+
+    The executable name is the whole test, deliberately. CLAUDE_CODE_ENTRYPOINT and CLAUDECODE
+    look like tidier markers but every child a session spawns inherits them, so a hook or a
+    notification helper would be reported as a session still holding the credential.
+    """
+    for name, want in (("claude", True), ("2.1.282", True), ("2.1.281", True),
+                       ("claude-token-rotate", False), ("claude-alert", False),
+                       ("notify-send", False), ("node", False), ("zsh", False)):
+        check(f"exe {name!r} {'counts' if want else 'is ignored'}",
+              bool(m.CLAUDE_EXE_RE.match(name)) is want)
+
+    env = {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": tok("S")}
+    marked = subprocess.Popen(["sleep", "20"],
+                              env={**env, "CLAUDE_CODE_ENTRYPOINT": "claude-vscode",
+                                   "CLAUDECODE": "1"})
+    plain = subprocess.Popen(["sleep", "20"], env=env)
+    try:
+        time.sleep(0.4)
+        pids = [pid for pid, _ in m.sessions_on(tok("S"))]
+        check("a token-carrying helper is not a session", plain.pid not in pids)
+        check("an inherited CLAUDE_CODE_* marker does not promote a helper",
+              marked.pid not in pids)
+    finally:
+        for q in (marked, plain):
+            q.kill()
+            q.wait()
+    check("empty for a token nothing holds", m.sessions_on(tok("Z")) == [])
+    check("empty for an empty token", m.sessions_on("") == [])
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
         for fn in (test_disable_beats_inheritance, test_parked_injection,
-                   test_both_windows_decide, test_file_handling, test_refusals):
+                   test_both_windows_decide, test_file_handling, test_refusals,
+                   test_session_detection):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

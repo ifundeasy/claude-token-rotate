@@ -149,6 +149,22 @@ survives a rotation.
 The second matters because auto-swap can write several times an hour; a single rolling backup
 would not be enough to recover the original.
 
+**It tells you when the credential is still in use.** When the live token crosses the threshold
+while a Claude Code session on this machine is still running on it, you get one desktop
+notification naming the credential, the window and how many sessions hold it. It fires once per
+crossing and only when a session genuinely has that token — a warning about a credential nothing
+is using is noise. `--no-notify` turns it off.
+
+Nothing is interrupted, and that is not a limitation to work around. There is no supported way to
+put a message into a running interactive session: the kernel refuses keystroke injection into
+another terminal (`dev.tty.legacy_tiocsti=0`), writing to its pts would only paint bytes over the
+display, and a signal would discard whatever the turn had in flight. Telling you is both the
+safest option and the only one that lets the turn finish first.
+
+Sessions are identified by executable name (`claude`, or the versioned launcher). Markers like
+`CLAUDE_CODE_ENTRYPOINT` look tidier but every child a session spawns inherits them, so a hook or
+a notification helper would be miscounted as a session.
+
 ### Using bash
 
 `CLAUDE_CODE_OAUTH_TOKEN` lives in `~/.zshenv`, which **bash does not read**. Point the tool
@@ -285,6 +301,7 @@ alias ctr='python3 /path/to/claude-token-rotate/main.py'
 | `--rotate-at PCT` | auto-swap threshold, applied to both the 5h and the weekly window (default 75) |
 | `--auto-rotate` | start with auto-swap on |
 | `--no-env-write` | never write a shell file |
+| `--no-notify` | no desktop notification when the live credential is still in use |
 | `--diagnose NAME` | test both paths (API and `claude -p`) for one credential |
 | `--once` `--json` | one snapshot · as JSON |
 | `--no-title` `--no-color` | leave the terminal title alone · no colour |
