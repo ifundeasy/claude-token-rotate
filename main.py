@@ -959,6 +959,68 @@ def env_toggle(path: str) -> tuple[str, bool]:
     return f"{TOKEN_COL} {what} in {os.path.basename(path)}", not was_active
 
 
+#: A Claude Code session runs as `claude`, or as the versioned launcher the installer drops in
+#: (2.1.282 and friends), and the editor extension runs as `claude` too. Matching on the command
+#: line would sweep in this tool and claude-alert, which merely have "claude" in their names and
+#: carry the token only because they inherited it from the same shell.
+CLAUDE_EXE_RE = re.compile(r"^(claude|\d+\.\d+\.\d+)$")
+
+
+def sessions_on(token: str) -> list[tuple[int, str]]:
+    """Running Claude Code sessions whose environment carries `token`, as (pid, description).
+
+    A process's environment is fixed when it starts, so this is the only honest answer to "is the
+    credential about to be rotated away still in use". The shell file says what the NEXT session
+    will inherit; it says nothing about the ones already running — which is exactly the gap that
+    makes a rotation look like it did nothing.
+
+    Linux only, and deliberately quiet about it: /proc is the sole source, and on a host without
+    it the answer is an empty list rather than an error, because not knowing is not a failure.
+    """
+    if not token or not os.path.isdir("/proc"):
+        return []
+    mine = {os.getpid(), os.getppid()}
+    out: list[tuple[int, str]] = []
+    want = ("CLAUDE_CODE_OAUTH_TOKEN=" + token).encode()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) in mine:
+            continue
+        try:
+            env = open(f"/proc/{entry}/environ", "rb").read()
+            if want not in env.split(b"\0"):
+                continue
+            exe = os.path.basename(os.readlink(f"/proc/{entry}/exe"))
+            # Only the executable name decides. CLAUDE_CODE_ENTRYPOINT looks like a tidier
+            # marker but every child a session spawns inherits it — hooks, helpers, a
+            # notify-send — and those would be counted as sessions holding the credential.
+            if not CLAUDE_EXE_RE.match(exe):
+                continue
+            cmd = open(f"/proc/{entry}/cmdline", "rb").read().replace(b"\0", b" ").decode(
+                errors="replace").strip()
+        except (OSError, ValueError):
+            continue                      # the process went away, or is not ours to read
+        out.append((int(entry), (cmd or exe)[:60]))
+    return sorted(out)
+
+
+def notify(title: str, body: str) -> bool:
+    """Best-effort desktop notification. Never raises, never blocks the draw loop.
+
+    Detached with Popen rather than run(): a notification daemon that hangs must not take the
+    dashboard down with it, and there is nothing in the reply worth waiting for.
+    """
+    exe = shutil.which("notify-send")
+    if not exe:
+        return False
+    try:
+        subprocess.Popen([exe, "--app-name=claude-token-rotate", "--urgency=critical",
+                          "--icon=dialog-warning", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
 def daemon_stop() -> str:
     """Ask the Claude Code supervisor to exit so the next client reads the new credential.
 
@@ -2215,6 +2277,9 @@ def main() -> int:
                     help="start with auto-rotate on (otherwise it resumes its last state)")
     ap.add_argument("--no-env-write", action="store_true",
                     help="never write the shell file — the t/T/z keys become read-only")
+    ap.add_argument("--no-notify", action="store_true",
+                    help="no desktop notification when the live credential crosses the threshold "
+                         "while sessions on this machine are still using it")
     ap.add_argument("--no-title", action="store_true",
                     help="leave the terminal title alone")
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colour")
@@ -2254,6 +2319,7 @@ def main() -> int:
     env_ok = not args.no_env_write
     auto_rotate = bool(args.auto_rotate) or bool(load_state().get("auto_rotate"))
     last_rotate, no_cand_said = 0.0, False
+    notify_ok, warned_tok = not args.no_notify, ""
 
     def read_live() -> None:
         """Refresh the cached view of the shell file. Cheap, and never fatal."""
@@ -2310,6 +2376,46 @@ def main() -> int:
         if args.log:
             log_readings(args.log, store, store.rows, results)
         return results
+
+    def warn_if_in_use(results: dict) -> str:
+        """Say something, once, when the live credential crosses the line while still in use.
+
+        Gated on a session actually holding the token ON THIS MACHINE. A warning about a
+        credential nothing is running against is noise — rotating away from it costs nobody
+        anything, and the percentage is already on screen. The point of the interruption is that
+        somebody is mid-session and about to be refused.
+
+        The notification is all it does. There is no supported way to put a message into a running
+        interactive session — the kernel refuses keystroke injection into another terminal
+        (dev.tty.legacy_tiocsti=0) and writing to its pts would only paint bytes over the display —
+        and a signal would discard whatever the turn had in flight. Telling the person is both the
+        safest option and the only one that lets them finish the turn first.
+        """
+        nonlocal warned_tok
+        tok, name = str(LIVE.get("token") or ""), LIVE.get("name")
+        if not tok or not name:
+            return ""
+        cur = results.get(tok, {})
+        p = worst_window(cur)
+        if p is None or p < rotate_at:
+            warned_tok = ""                    # back under the line: re-arm for the next crossing
+            return ""
+        if warned_tok == tok:
+            return ""
+        busy = sessions_on(tok)
+        if not busy:
+            return ""
+        warned_tok = tok
+        p5 = upct(cur, "u5h")
+        which = "5h" if (p5 is not None and p5 >= rotate_at) else "weekly"
+        plural = "s" if len(busy) > 1 else ""
+        line = (f"{name} is at {p:.0f}% of its {which} window and {len(busy)} "
+                f"session{plural} here still hold{'' if plural else 's'} it")
+        if notify_ok:
+            notify(f"Claude quota · {name} at {p:.0f}%",
+                   f"{len(busy)} session{plural} on this machine still using it.\n"
+                   f"Finish the turn, then press t to rotate.")
+        return "⚠ " + line + " — finish up, then t"
 
     def auto_swap(results: dict, rows: list[dict[str, str]]) -> str:
         """Swap in a fresher credential when the live one is spent. Returns a status line or "".
@@ -2436,11 +2542,11 @@ def main() -> int:
 
                 rows = sort_rows(store, store.rows, results, sort)
                 if swept:
-                    swap = auto_swap(results, rows)
-                    if swap:
-                        flash = swap
-                        events.append(swap)
-                        del events[:-8]
+                    for msg in (warn_if_in_use(results), auto_swap(results, rows)):
+                        if msg:
+                            flash = msg
+                            events.append(msg)
+                            del events[:-8]
                 if title_on:
                     t = title_safe(title_text(store, rows, results))
                     if t != last_title:            # only on change: some terminals redraw the tab
