@@ -51,8 +51,50 @@ the credential list is read-only.
 
 THE LIVE CREDENTIAL. One credential is the one your shell actually exports, and the dashboard both
 shows it (cyan in the NAME column) and can change it. `t` writes a chosen token into the shell file,
-`z` comments that line out and back, and `T` arms auto-rotate, which swaps in a fresher credential
-once the live one passes `--rotate-at` (75% of its 5h window by default).
+`z` switches that line off and back on, and `T` cycles what auto-rotate is allowed to do.
+
+    trigger     max(5h, weekly) on the live credential >= --rotate-at   (75%)
+                and at least ROTATE_GAP seconds since the last swap
+                and the live credential is not pinned
+
+    candidate   5h     < PICK_5H          (50%)
+                weekly < PICK_7D          (80%)
+                       < PICK_7D_TIGHT    (60%) while >3 WORKING days remain
+                max(5h, weekly) < --rotate-at
+
+    choose      the lowest max(5h, weekly)
+
+Each window is judged on its own because they say different things. A credential at 4% of its five
+hours and 96% of its week is fresh by the first number and refused on the next request. And the
+weekly test counts WORKING days: Saturdays and Sundays inside the remaining window are subtracted
+before the three-day test, so being near a weekend relaxes the budget rather than tightening it —
+those are the days least likely to spend it.
+
+There is deliberately no "beat the incumbent by N points" margin. The per-window limits already say
+what a sound replacement is, and a margin on top would reject candidates that are plainly fine.
+
+`T` has three positions, because "stop rotating my live credential" and "stop tracking which
+credential is best" are different wishes:
+
+    off    the shell file is not touched at all
+    park   the best credential is written SWITCHED OFF — recorded, but nothing picks it up
+    on     written, and the file's own on/off state is left alone
+
+`park` needs the `unset` line as much as the comment does. A terminal inherits the variable from
+the desktop session before it ever reads the file, so commenting the export out alone would leave
+a new session quietly using whichever token was live when the desktop started.
+
+A credential injected by hand is PINNED: auto-rotate will not swap it away at any utilization, and
+the pin lifts only when that credential can no longer serve a request at all. Automation does not
+get to reverse a decision a person made. Injecting another moves the pin, and it survives a
+restart. `t` is forced in the other direction too — its "freshest" pick ignores the candidate
+limits, so it still answers when nothing is comfortable.
+
+When the live credential crosses the threshold while a Claude Code session ON THIS MACHINE is still
+running on it, one desktop notification says so, once per crossing. Nothing is interrupted: there
+is no supported way to put a message into a running interactive session — the kernel refuses
+keystroke injection into another terminal, writing to its pts only paints over the display, and a
+signal would discard whatever the turn had in flight.
 
 Only the assignment is ever rewritten. The file is read as lines, exactly one of them is rebuilt,
 and the rest are written back untouched — which is why a comment block explaining why the variable
@@ -82,17 +124,19 @@ USAGE
     python3 main.py --alert 80                  # bell when a window crosses 80%
     python3 main.py --log usage.csv             # append every reading for later analysis
     python3 main.py --once --json               # one machine-readable snapshot
-    python3 main.py --auto-rotate                # swap credentials at 75% unattended
+    python3 main.py --auto-rotate                # swap credentials unattended past the threshold
+    python3 main.py --rotate-mode park           # keep the pick fresh, never switch it on
     python3 main.py --rotate-at 60 --env-file ~/.bashrc
     python3 main.py --no-env-write               # never touch a shell file
+    python3 main.py --no-notify                  # no banner when the live token is still in use
     python3 main.py --from-env ../outline-audit/.env
 
 KEYS
     views    h 5h    w 7d    o overage    b all
     read     r refresh now    s cycle sort    i inspect one credential's raw headers
-    copy     1-9 that row's token    c any row by number    p most 5h headroom    x Markdown
+    copy     1-9 that row's token    c any row by number    p furthest from any limit    x Markdown
     manage   a add credential    d delete    e edit name and/or token
-    shell    t inject into ~/.zshenv    z activate/deactivate    T auto-rotate on/off
+    shell    t inject (pins it)    z switch on/off    T auto-rotate off|park|on
     other    +/- interval    q quit
 """
 

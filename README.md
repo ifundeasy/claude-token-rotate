@@ -212,6 +212,46 @@ Sessions are identified by executable name (`claude`, or the versioned launcher)
 `CLAUDE_CODE_ENTRYPOINT` look tidier but every child a session spawns inherits them, so a hook or
 a notification helper would be miscounted as a session.
 
+### Picking up a rotation without a new terminal
+
+`~/.zshenv` is read once, when a shell starts, so a shell that is already running keeps the token
+it began with. `shell/zsh-autoreload.zsh` re-reads the file just before the next prompt, but only
+when it has actually changed:
+
+```bash
+# ~/.zshrc
+source /path/to/claude-token-rotate/shell/zsh-autoreload.zsh
+```
+
+It keys on the file's **inode**, not only its mtime. `mtime` has one-second resolution, so two
+rotations inside the same second would look identical; every write goes through a temp file and a
+rename, so the inode changes without fail.
+
+Re-sourcing is safe by construction: the PATH blocks are guarded against duplicates, and a parked
+credential re-runs its `unset`, which is exactly what should happen to a shell still holding the
+old value.
+
+### What still has to restart
+
+| | Needs a restart? |
+|---|---|
+| Your shell | **No** — the hook re-reads the file in place |
+| A new `claude` started from that shell | **No** — it inherits the current value |
+| The supervisor and its background sessions | Yes, but only the supervisor: `claude daemon stop --any` |
+| The interactive session you are sitting in | **Yes** — nothing can change it |
+
+The last row is an operating-system guarantee, not a limitation of this tool. A process receives a
+*copy* of the environment when it is exec'd, and nothing outside it can alter that copy. Node reads
+it into `process.env` at startup as well, so even writing to `/proc/<pid>/environ` would change
+nothing the session looks at.
+
+So the shortest path after a rotation, without closing a single terminal:
+
+```bash
+claude daemon stop --any     # the supervisor picks up the new token
+claude -r                    # same terminal, same shell, fresh credential
+```
+
 ### Using bash
 
 `CLAUDE_CODE_OAUTH_TOKEN` lives in `~/.zshenv`, which **bash does not read**. Point the tool
