@@ -106,8 +106,11 @@ def test_both_windows_decide(d: str) -> None:
     spent = {tok("L"): reading(80, 10), tok("W"): reading(90, 10), tok("G"): reading(10, 88)}
     check("no candidate when every row is past the line",
           m.rotate_pick(store, store.rows, spent, exclude=tok("L"), ceiling=75.0) is None)
-    check("a forced pick ignores the ceiling",
+    check("a forced pick still answers when nothing is comfortable",
           m.rotate_pick(store, store.rows, spent, exclude=tok("L")) is not None)
+    check("a strict pick refuses instead of settling",
+          m.rotate_pick(store, store.rows, spent, exclude=tok("L"),
+                        ceiling=75.0, strict=True) is None)
 
 
 def test_file_handling(d: str) -> None:
@@ -197,12 +200,63 @@ def test_session_detection(d: str) -> None:
     check("empty for an empty token", m.sessions_on("") == [])
 
 
+def test_pick_rules(d: str) -> None:
+    """Candidate limits, and the weekend-aware weekly budget.
+
+    Timestamps are fixed rather than taken from the clock: a rule about which weekday it is would
+    otherwise pass or fail depending on when the suite runs.
+    """
+    import datetime as dt
+
+    def span(start: str, end: str) -> float | None:
+        fmt = "%Y-%m-%d %H:%M"
+        a = dt.datetime.strptime(start, fmt).timestamp()
+        b = dt.datetime.strptime(end, fmt).timestamp()
+        return m.workdays_left(b, now=a)
+
+    # 2026-09-28 is a Monday.
+    check("Mon->Thu is 3 working days", abs(span("2026-09-28 00:00", "2026-10-01 00:00") - 3) < .01)
+    check("Fri->Tue drops Sat and Sun",
+          abs(span("2026-10-02 00:00", "2026-10-06 00:00") - 2) < .01)
+    check("Sat->Sun is not working time at all",
+          span("2026-10-03 00:00", "2026-10-04 12:00") <= 0)
+    check("a window already past reads zero", m.workdays_left(1.0, now=2.0) == 0.0)
+    check("no reset, no answer", m.workdays_left(None) is None)
+
+    now = dt.datetime.strptime("2026-09-28 00:00", "%Y-%m-%d %H:%M").timestamp()
+
+    def row(p5: float, p7: float, reset: str) -> dict[str, object]:
+        return {"u5h": f"{p5 / 100:.2f}", "u7d": f"{p7 / 100:.2f}",
+                "r7d": str(dt.datetime.strptime(reset, "%Y-%m-%d %H:%M").timestamp()),
+                "s5h": "allowed", "s7d": "allowed", "ok": True, "code": 200}
+
+    # Mon -> Fri is 4 working days: more than three, so the tighter budget applies.
+    loose, tight = row(10, 70, "2026-10-01 00:00"), row(10, 70, "2026-10-02 12:00")
+    check("<=3 working days left: the 80% budget", m.weekly_ceiling(loose) == m.PICK_7D)
+    check(">3 working days left: the 60% budget", m.weekly_ceiling(tight) == m.PICK_7D_TIGHT)
+    check("70% weekly passes the loose budget", m.eligible(loose))
+    check("70% weekly fails the tight budget", not m.eligible(tight))
+
+    check("5h at the limit is out", not m.eligible(row(50, 10, "2026-10-01 00:00")))
+    check("5h under the limit is in", m.eligible(row(49, 10, "2026-10-01 00:00")))
+    check("a missing window is never eligible", not m.eligible({"u5h": "0.10"}))
+
+    store = store_with(d, live=tok("L"), weekly_heavy=tok("W"), ok=tok("G"))
+    res = {tok("L"): row(80, 10, "2026-10-01 00:00"),
+           tok("W"): row(4, 96, "2026-10-01 00:00"),     # idle hour, spent week
+           tok("G"): row(20, 20, "2026-10-01 00:00")}
+    pick = m.rotate_pick(store, store.rows, res, exclude=tok("L"), ceiling=75.0)
+    check("the spent week is refused, the sound one chosen",
+          pick is not None and store.name(pick[0]) == "ok")
+    _ = now
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
         for fn in (test_disable_beats_inheritance, test_parked_injection,
                    test_both_windows_decide, test_file_handling, test_refusals,
-                   test_session_detection):
+                   test_session_detection, test_pick_rules):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

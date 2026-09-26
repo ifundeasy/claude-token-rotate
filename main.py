@@ -135,7 +135,15 @@ ENV_FILE = os.path.expanduser("~/.zshenv")
 #: table where everything sits near the threshold would rewrite the shell file every refresh.
 ROTATE_AT = 75.0                        # --rotate-at: 5h utilization that triggers a swap
 ROTATE_GAP = 300.0                      # seconds between automatic swaps
-ROTATE_MARGIN = 10.0                    # percentage points the candidate must beat the incumbent by
+#: Per-window ceilings a candidate must be under. The five-hour figure is a short-term signal and
+#: the weekly one a budget, so they get separate limits rather than one blended score: a
+#: replacement that is quiet this hour but nearly out of week is not a replacement.
+PICK_5H = 50.0
+PICK_7D = 80.0
+PICK_7D_TIGHT = 60.0
+#: Working days left in the weekly window above which the tighter weekly budget applies. Weekends
+#: do not count: quota is not spent on them, so being near one should not make the budget stricter.
+PICK_WORKDAYS = 3.0
 #: The API's machine-readable reasons, in words someone can actually act on. An untranslated
 #: reason is passed through rather than hidden — a new one should look odd, not invisible.
 OVERAGE_WORDS = {
@@ -1040,6 +1048,49 @@ def daemon_stop() -> str:
     return "supervisor stopped" if out.returncode == 0 else f"daemon stop exited {out.returncode}"
 
 
+def workdays_left(reset: float | None, now: float | None = None) -> float | None:
+    """Days until a weekly window resets, not counting Saturdays and Sundays.
+
+    A weekly budget is spent on working days, so the weekend is not time the budget has to cover.
+    Counting it would make the allowance look tighter right before a weekend — backwards, since
+    those are the days least likely to need it.
+
+    Whole weekend DATES inside the span are subtracted from the elapsed-days figure, so the result
+    can go negative when the window ends inside a weekend. That is fine: negative is simply "not
+    more than three", which is the only question asked of it.
+    """
+    if reset is None:
+        return None
+    now = time.time() if now is None else now
+    total = (reset - now) / 86400.0
+    if total <= 0:
+        return 0.0
+    start, end = datetime.date.fromtimestamp(now), datetime.date.fromtimestamp(reset)
+    weekend, day = 0, start
+    while day <= end:
+        weekend += day.weekday() >= 5                   # 5 = Saturday, 6 = Sunday
+        day += datetime.timedelta(days=1)
+    return total - weekend
+
+
+def weekly_ceiling(r: dict[str, object]) -> float:
+    """How much of the weekly window a candidate may already have spent.
+
+    Tighter while the week still has working days to run, because the budget has to stretch over
+    them; looser once the reset is close, when whatever is left would be wasted anyway.
+    """
+    left = workdays_left(ureset(r, "r7d"))
+    return PICK_7D_TIGHT if (left is not None and left > PICK_WORKDAYS) else PICK_7D
+
+
+def eligible(r: dict[str, object]) -> bool:
+    """Whether a credential is fit to be rotated INTO. Both windows have to pass on their own."""
+    p5, p7 = upct(r, "u5h"), upct(r, "u7d")
+    if p5 is None or p5 >= PICK_5H:
+        return False
+    return p7 is not None and p7 < weekly_ceiling(r)
+
+
 def worst_window(r: dict[str, object]) -> float | None:
     """How close a credential is to its nearest limit: the higher of its 5h and 7d utilization.
 
@@ -1052,13 +1103,16 @@ def worst_window(r: dict[str, object]) -> float | None:
 
 
 def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
-                exclude: str = "", ceiling: float | None = None
+                exclude: str = "", ceiling: float | None = None, strict: bool = False
                 ) -> "tuple[dict[str, str], float] | None":
     """The credential furthest from any of its limits, skipping one token and anything refusing.
 
-    Ranked on `worst_window`, so a row is only as fresh as its busiest window. `ceiling` drops
-    candidates that are already at or past the rotation threshold on either window — swapping into
-    one of those buys nothing, since it trips the same trigger on the next cycle.
+    `strict` applies the per-window candidate limits, and `ceiling` drops anything already at or
+    past the rotation threshold — swapping into that buys nothing, since it trips the same trigger
+    on the next cycle. Automation passes both. A person asking for the best available passes
+    neither: refusing to answer because no credential is comfortable leaves them with nothing when
+    what they wanted was the least bad one. Ranking is always `worst_window`, so a row is only
+    ever as fresh as its busiest window.
 
     The blocked filter matters more here than it does for a clipboard copy: a row whose state
     starts with EXTRA, unauthorized, forbidden or rate cannot serve a request at all, so promoting
@@ -1071,6 +1125,8 @@ def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
             continue
         r = results.get(tok, {})
         if state_note(r).startswith(("EXTRA", "unauthorized", "forbidden", "rate")):
+            continue
+        if strict and not eligible(r):
             continue
         p = worst_window(r)
         if p is not None and (ceiling is None or p < ceiling):
@@ -2320,6 +2376,10 @@ def main() -> int:
     auto_rotate = bool(args.auto_rotate) or bool(load_state().get("auto_rotate"))
     last_rotate, no_cand_said = 0.0, False
     notify_ok, warned_tok = not args.no_notify, ""
+    # A hand-injected credential is a decision, and auto-rotate does not get to reverse it. The
+    # pin outlives a restart because the decision does.
+    pinned = str(load_state().get("pinned") or "")
+    pin_said = False
 
     def read_live() -> None:
         """Refresh the cached view of the shell file. Cheap, and never fatal."""
@@ -2435,7 +2495,7 @@ def main() -> int:
         is precisely the moment quota is tight. The manual key offers that; automation does not
         get to make that call.
         """
-        nonlocal last_rotate, no_cand_said, auto_rotate
+        nonlocal last_rotate, no_cand_said, auto_rotate, pin_said
         if not (auto_rotate and env_ok) or LIVE.get("err") or LIVE.get("ambiguous"):
             return ""
         tok = str(LIVE.get("token") or "")
@@ -2450,12 +2510,22 @@ def main() -> int:
         which = "5h" if (p5 is not None and p5 >= rotate_at) else "weekly"
         if p5 is not None and p7 is not None and p5 >= rotate_at and p7 >= rotate_at:
             which = "5h and weekly"
+        if pinned and pinned == tok and not state_note(cur).startswith(
+                ("EXTRA", "unauthorized", "forbidden", "rate")):
+            # Held because a person chose it. The pin lifts only when the credential can no longer
+            # serve a request at all; below that, protecting the choice is the whole point.
+            if not pin_said:
+                pin_said = True
+                return (f"auto-rotate: {LIVE.get('name')} at {now:.0f}% was injected by hand — "
+                        f"holding it · inject another with t to release")
+            return ""
+        pin_said = False
         if time.time() - last_rotate < ROTATE_GAP:
             return ""
         # `ceiling` keeps out anything already past the line on either window: swapping into one
         # trips the same trigger next cycle and the dashboard spends its life rewriting $HOME.
-        pick = rotate_pick(store, rows, results, exclude=tok, ceiling=rotate_at)
-        if pick is None or pick[1] > now - ROTATE_MARGIN:
+        pick = rotate_pick(store, rows, results, exclude=tok, ceiling=rotate_at, strict=True)
+        if pick is None:
             if not no_cand_said:
                 no_cand_said = True
                 return (f"auto-rotate: {LIVE.get('name')} at {now:.0f}% ({which}) but no "
@@ -2672,7 +2742,11 @@ def main() -> int:
                         flash = f"not written: {exc}"
                         continue
                     read_live()
-                    flash = f"injected '{store.name(row)}' — {msg}"
+                    pinned = store.token(row)          # a hand-made choice auto-rotate must keep
+                    _st = load_state()
+                    _st["pinned"] = pinned
+                    save_state(_st)
+                    flash = f"injected '{store.name(row)}' — {msg} · pinned"
                     if was_off:
                         flash += " · switched ON (it was off)"
                     stop = ask(keys, "  a running supervisor keeps its old credential — "
