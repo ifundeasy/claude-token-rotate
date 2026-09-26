@@ -99,10 +99,41 @@ column and can change it.
 Auto mode **never** touches the supervisor. Stopping it terminates live sessions — that is a
 decision a person makes, not a timer.
 
-**Both windows decide.** A credential at 4% of its five hours and 96% of its week is fresh by the
-five-hour number alone and refused on the next request, so the rotator ranks every row by whichever
-of its two windows is closest to its limit, and will not swap into one that is already past the
-threshold on either. When nothing qualifies it says so once and stays put rather than churning.
+**Both windows decide, with separate limits.** A credential at 4% of its five hours and 96% of its
+week is fresh by the five-hour number alone and refused on the next request, so each window is
+checked on its own:
+
+```
+trigger     max(5h, weekly) on the live credential >= --rotate-at   (75%)
+            and at least 300s since the last swap
+            and the live credential is not pinned
+
+candidate   5h     < 50%
+            weekly < 80%, or < 60% while more than 3 WORKING days remain
+            max(5h, weekly) < 75%
+
+choose      the lowest max(5h, weekly)
+```
+
+**Working days, not calendar days.** The weekly budget is spent on the days you work, so Saturdays
+and Sundays inside the remaining window are subtracted before the 3-day test. Being close to a
+weekend therefore relaxes the budget rather than tightening it — those are the days least likely
+to need the quota.
+
+The tighter 60% band exists because a week with room left to run has to stretch; once the reset is
+near, whatever is unspent would be wasted anyway, so the limit returns to 80%.
+
+There is no "beat the incumbent by N points" rule. The per-window limits already say what counts
+as a sound replacement, and a margin on top would reject candidates that are plainly fine.
+
+**A hand-injected credential is pinned.** `t` records your choice, and auto-rotate will not swap
+it away — not at 80%, not at 95%. The pin lifts only when that credential can no longer serve a
+request at all (`EXTRA spent`, rejected, unauthorized), because at that point protecting the choice
+protects nothing. Injecting another credential moves the pin; the pin survives a restart.
+
+`t` is also the forced pick in the other sense: choosing "the freshest" from its prompt ignores the
+candidate limits entirely, so it still answers when no credential is comfortable. Refusing to name
+one would leave you with nothing, when what you asked for was the least bad option.
 
 **A switched-off variable is kept fresh, but stays off.** Writing a value and switching it on are
 separate decisions, and the second one is yours. With `z` off, auto-rotate still updates the parked
