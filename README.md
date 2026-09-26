@@ -93,7 +93,7 @@ column and can change it.
 | How | Behaviour |
 |---|---|
 | **Manual** (`t`) | pick a row, or leave blank for the freshest → confirm → write → offered `claude daemon stop --any` |
-| **Auto** (`T`) | once the live token passes `--rotate-at` (default 75%) on **either** its 5h or its weekly window, a fresher credential is swapped in |
+| **Auto** (`T`) | cycles three ways — see below |
 | **Off** (`z`) | comments the `export` line out *and* writes an explicit `unset`; press again to re-enable |
 
 Auto mode **never** touches the supervisor. Stopping it terminates live sessions — that is a
@@ -134,6 +134,22 @@ protects nothing. Injecting another credential moves the pin; the pin survives a
 `t` is also the forced pick in the other sense: choosing "the freshest" from its prompt ignores the
 candidate limits entirely, so it still answers when no credential is comfortable. Refusing to name
 one would leave you with nothing, when what you asked for was the least bad option.
+
+**`T` cycles three ways**, because "stop rotating my live credential" and "stop tracking which
+credential is best" are different wishes:
+
+| Mode | What auto-rotate does past the threshold |
+|---|---|
+| `off` | nothing — the shell file is left alone entirely |
+| `park` | writes the best credential **switched off**: recorded, but nothing uses it |
+| `on` | writes it and leaves the file's own on/off state alone |
+
+`park` is the answer to "rotate it, but do not let anything pick it up". The value is written
+commented out **and** an `unset` line goes with it, so a new terminal gets nothing at all — not the
+rotator's pick, and not the stale value it inherited from the desktop session. Press `z` when you
+want to hand the parked credential over.
+
+`--rotate-mode off|park|on` sets it from the command line.
 
 **A switched-off variable is kept fresh, but stays off.** Writing a value and switching it on are
 separate decisions, and the second one is yours. With `z` off, auto-rotate still updates the parked

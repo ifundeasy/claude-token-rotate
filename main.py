@@ -144,6 +144,14 @@ PICK_7D_TIGHT = 60.0
 #: Working days left in the weekly window above which the tighter weekly budget applies. Weekends
 #: do not count: quota is not spent on them, so being near one should not make the budget stricter.
 PICK_WORKDAYS = 3.0
+#: What auto-rotate is allowed to do, cycled with `T`.
+#:   off   write nothing at all
+#:   park  keep the value fresh but never switch it on, so the shell file is a standing
+#:         recommendation you opt into with `z`
+#:   on    keep the value fresh and leave the on/off state exactly as it was
+#: `park` exists so that "stop rotating my live credential" does not have to mean "stop tracking
+#: which credential is best" — those are different wishes and one key used to conflate them.
+ROTATE_MODES = ("off", "park", "on")
 #: The API's machine-readable reasons, in words someone can actually act on. An untranslated
 #: reason is passed through rather than hidden — a new one should look odd, not invisible.
 OVERAGE_WORDS = {
@@ -2014,10 +2022,12 @@ def live_note(results: dict, color: bool) -> tuple[str, str, str] | None:
     at = float(LIVE.get("rotate_at") or ROTATE_AT)
     if not LIVE.get("writable"):
         auto = d("auto-swap is off here (--no-env-write)")
-    elif LIVE.get("auto"):
+    elif LIVE.get("auto") == "on":
         auto = hi("auto-swap on", GREEN) + d(f" above {at:.0f}%")
+    elif LIVE.get("auto") == "park":
+        auto = hi("auto-swap parked", YELLOW) + d(f" above {at:.0f}% — kept fresh, left off")
     else:
-        auto = d("auto-swap off ") + hi("T", CYAN) + d(" turns it on")
+        auto = d("auto-swap off ") + hi("T", CYAN) + d(" cycles it")
 
     if LIVE.get("err"):
         return "!", RED, d(f"cannot read {where} — {LIVE['err']}")
@@ -2132,13 +2142,13 @@ def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, 
         out.append("")
         g = (lambda s: paint(s, CYAN, color))
         d = (lambda s: paint(s, DIM, color))
-        on = bool(LIVE.get("auto"))
+        mode = str(LIVE.get("auto") or "off")
         left = [f"{g('h')}{d(' 5h')}  {g('w')}{d(' 7d')}  {g('o')}{d(' over')}  {g('b')}{d(' all')}",
                 f"{g('1-9')}{d('/')}{g('c')}{d(' copy')}  {g('p')}{d(' best')}  "
                 f"{g('x')}{d(' markdown')}",
                 f"{g('t')}{d(' inject')}  {g('z')}{d(' on/off')}  {g('T')}"
-                + paint(" auto-rotate " + ("ON" if on else "off"),
-                        GREEN if on else DIM, color)]
+                + paint(" auto-rotate " + mode,
+                        GREEN if mode == "on" else YELLOW if mode == "park" else DIM, color)]
         right = [f"{g('r')}{d(' refresh')}  {g('s')}{d(' sort')}  {g('i')}{d(' raw')}  "
                  f"{g('D')}{d(' diagnose')}  {g('+/-')}{d(' interval')}",
                  f"{g('a')}{d(' add')}  {g('d')}{d(' delete')}  {g('e')}{d(' edit')}  "
@@ -2331,6 +2341,9 @@ def main() -> int:
                          f"(default {ROTATE_AT:.0f})")
     ap.add_argument("--auto-rotate", action="store_true",
                     help="start with auto-rotate on (otherwise it resumes its last state)")
+    ap.add_argument("--rotate-mode", choices=ROTATE_MODES,
+                    help="off: never write · park: keep the value fresh but switched off · "
+                         "on: keep it fresh and leave the on/off state alone")
     ap.add_argument("--no-env-write", action="store_true",
                     help="never write the shell file — the t/T/z keys become read-only")
     ap.add_argument("--no-notify", action="store_true",
@@ -2373,7 +2386,16 @@ def main() -> int:
     rotate_at = max(1.0, min(100.0, args.rotate_at))
     env_path = os.path.expanduser(args.env_file)
     env_ok = not args.no_env_write
-    auto_rotate = bool(args.auto_rotate) or bool(load_state().get("auto_rotate"))
+    _saved = load_state()
+    if args.rotate_mode:
+        auto_rotate = args.rotate_mode
+    elif args.auto_rotate:
+        auto_rotate = "on"
+    else:                                       # the older boolean key still decides if present
+        auto_rotate = str(_saved.get("rotate_mode")
+                          or ("on" if _saved.get("auto_rotate") else "off"))
+    if auto_rotate not in ROTATE_MODES:
+        auto_rotate = "off"
     last_rotate, no_cand_said = 0.0, False
     notify_ok, warned_tok = not args.no_notify, ""
     # A hand-injected credential is a decision, and auto-rotate does not get to reverse it. The
@@ -2496,7 +2518,7 @@ def main() -> int:
         get to make that call.
         """
         nonlocal last_rotate, no_cand_said, auto_rotate, pin_said
-        if not (auto_rotate and env_ok) or LIVE.get("err") or LIVE.get("ambiguous"):
+        if auto_rotate == "off" or not env_ok or LIVE.get("err") or LIVE.get("ambiguous"):
             return ""
         tok = str(LIVE.get("token") or "")
         if not tok or not LIVE.get("name"):
@@ -2534,11 +2556,13 @@ def main() -> int:
         row, p = pick
         old, was_on = LIVE.get("name"), bool(LIVE.get("active"))
         try:
-            # activate=None: keep the file's own on/off state. Refreshing a parked value is
-            # housekeeping; switching it on would be overruling the person who parked it.
-            env_set(env_path, store, store.token(row), activate=None)
+            # `park` writes it switched off on purpose; `on` keeps the file's own state, because
+            # refreshing a parked value is housekeeping and switching it on would overrule the
+            # person who parked it.
+            env_set(env_path, store, store.token(row),
+                    activate=False if auto_rotate == "park" else None)
         except (RuntimeError, OSError) as exc:
-            auto_rotate = False        # a failure that repeats every interval is noise, not news
+            auto_rotate = "off"        # a failure that repeats every interval is noise, not news
             read_live()
             return f"auto-rotate OFF — write failed: {exc}"
         last_rotate, no_cand_said = time.time(), False
@@ -2754,15 +2778,20 @@ def main() -> int:
                     flash += " · " + (daemon_stop() if stop.lower().startswith("y")
                                       else "restart Claude Code clients to pick it up")
                 elif key == "T":
-                    auto_rotate = not auto_rotate
+                    auto_rotate = ROTATE_MODES[
+                        (ROTATE_MODES.index(auto_rotate) + 1) % len(ROTATE_MODES)]
                     st = load_state()
-                    st["auto_rotate"] = auto_rotate
+                    st["rotate_mode"] = auto_rotate
+                    st.pop("auto_rotate", None)          # superseded by the three-way mode
                     save_state(st)
                     read_live()
-                    if not auto_rotate:
-                        flash = "auto-rotate OFF"
-                    elif not env_ok:
-                        flash = "auto-rotate ON, but --no-env-write means nothing will be written"
+                    if not env_ok:
+                        flash = f"auto-rotate {auto_rotate} — but --no-env-write blocks every write"
+                    elif auto_rotate == "off":
+                        flash = "auto-rotate OFF — the shell file is left alone entirely"
+                    elif auto_rotate == "park":
+                        flash = (f"auto-rotate PARK — past {rotate_at:.0f}% the best credential is "
+                                 f"written switched off · z activates it")
                     else:
                         flash = f"auto-rotate ON — swaps when the live token passes {rotate_at:.0f}%"
                 elif key == "z":

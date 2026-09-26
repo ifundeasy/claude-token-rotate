@@ -251,12 +251,37 @@ def test_pick_rules(d: str) -> None:
     _ = now
 
 
+def test_park_mode(d: str) -> None:
+    """Parked rotation must leave a new terminal with nothing at all.
+
+    Writing the value commented out is not enough on its own: a terminal inherits the variable
+    from the desktop session before it ever reads the file, so the `unset` is what makes "off"
+    actually mean off. Without it, a new session would quietly keep using whichever token was
+    live when the desktop started.
+    """
+    store = store_with(d, old=tok("O"), picked=tok("P"))
+    rc = os.path.join(d, "park")
+    with open(rc, "w", encoding="utf-8") as fh:
+        fh.write(f'# doc\nexport {m.TOKEN_COL}="{tok("O")}"\n')
+
+    check("active to begin with", shell_sees(rc) == tok("O"))
+    m.env_set(rc, store, tok("P"), activate=False)          # what `park` does
+    st = m.env_state(rc, store)
+    check("park: a new terminal gets nothing", shell_sees(rc) == "EMPTY")
+    check("park: the rotator's pick is still recorded", st["token"] == tok("P"))
+    check("park: recorded but not live", st["active"] is False)
+    check("park: an unset line is what enforces it", bool(st["unsets"]))
+
+    m.env_toggle(rc)
+    check("z then hands over the parked pick", shell_sees(rc) == tok("P"))
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
         for fn in (test_disable_beats_inheritance, test_parked_injection,
                    test_both_windows_decide, test_file_handling, test_refusals,
-                   test_session_detection, test_pick_rules):
+                   test_session_detection, test_pick_rules, test_park_mode):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)
