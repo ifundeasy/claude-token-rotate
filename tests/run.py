@@ -278,6 +278,27 @@ def test_park_mode(d: str) -> None:
     check("z then hands over the parked pick", shell_sees(rc) == tok("P"))
 
 
+def test_pin_lifts_when_spent(d: str) -> None:
+    """A pinned credential is used until it is spent — and then auto-rotate must move off it.
+
+    A spent window answers 429 WITH its quota headers, so the probe sets no `err` and only the
+    status says so ("5h rejected"). Missing that is how a pin outlived its credential.
+    """
+    at75 = reading(75, 40)
+    spent5 = {**reading(100, 40), "ok": False, "code": 429, "s5h": "rejected"}
+    spent7 = {**reading(20, 100), "ok": False, "code": 429, "s7d": "rejected"}
+    check("pin: holds at 75% — not spent yet", m.pin_holds(at75))
+    check("pin: lifts when the 5h window is spent", not m.pin_holds(spent5))
+    check("pin: lifts when the weekly window is spent", not m.pin_holds(spent7))
+    check("pin: lifts on unauthorized", not m.pin_holds({"err": "unauthorized"}))
+
+    # data.json must never hold a credential — the pin is recorded as a digest.
+    check("pin id is not the token", m.pin_id(tok("A")) != tok("A") and "sk-ant" not in m.pin_id(tok("A")))
+    check("pin id of a pin id is itself (a file already migrated stays put)",
+          m.pin_id(m.pin_id(tok("A"))) == m.pin_id(tok("A")))
+    check("pin ids tell tokens apart", m.pin_id(tok("A")) != m.pin_id(tok("B")))
+
+
 LOGIN = {"accessToken": "sk-ant-oat01-LOGIN-ACCESS", "refreshToken": "sk-ant-ort01-LOGIN-REFRESH",
          "expiresAt": 1, "scopes": ["user:inference", "user:profile"],
          "subscriptionType": "team", "rateLimitTier": "default_claude_max"}
@@ -449,7 +470,7 @@ def main() -> int:
         for fn in (test_disable_beats_inheritance, test_parked_injection,
                    test_both_windows_decide, test_file_handling, test_refusals,
                    test_session_detection, test_pick_rules, test_park_mode,
-                   test_creds_follow, test_statusline_account):
+                   test_creds_follow, test_statusline_account, test_pin_lifts_when_spent):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

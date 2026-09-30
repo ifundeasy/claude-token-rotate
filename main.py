@@ -1779,6 +1779,26 @@ def state_short(r: dict[str, object]) -> str:
     return "allowed" if (r.get("s5h") or r.get("s7d")) else "?"
 
 
+#: States in which a pinned credential can no longer serve a request, so the pin lifts. The two
+#: `rejected` ones are what a spent window reports: the probe gets a 429 that still carries the
+#: quota headers, so no `err` is set and only the status says the credential is done.
+PIN_RELEASE = ("EXTRA", "unauthorized", "forbidden", "rate", "5h rejected", "7d rejected")
+
+
+def pin_holds(r: dict[str, object]) -> bool:
+    """Whether a hand-injected credential is still worth protecting from auto-rotate."""
+    return not state_note(r).startswith(PIN_RELEASE)
+
+
+def pin_id(token: str) -> str:
+    """What data.json records for a pin: a digest, never the token itself.
+
+    An older state file held the raw token. That still maps to the same digest, so a pin made
+    before this change keeps holding, and the file is rewritten without the token on load.
+    """
+    return _digest(token) if token.startswith("sk-ant-") else token
+
+
 def state_note(r: dict[str, object]) -> str:
     """The limit that actually binds this credential, named by which window it is.
 
@@ -2592,7 +2612,11 @@ def main() -> int:
     notify_ok, warned_tok = not args.no_notify, ""
     # A hand-injected credential is a decision, and auto-rotate does not get to reverse it. The
     # pin outlives a restart because the decision does.
-    pinned = str(load_state().get("pinned") or "")
+    _st0 = load_state()
+    pinned = pin_id(str(_st0.get("pinned") or ""))
+    if pinned and _st0.get("pinned") != pinned:  # an older file held the raw token: drop it now
+        _st0["pinned"] = pinned
+        save_state(_st0)
     pin_said = False
 
     def read_live() -> None:
@@ -2738,8 +2762,7 @@ def main() -> int:
         which = "5h" if (p5 is not None and p5 >= rotate_at) else "weekly"
         if p5 is not None and p7 is not None and p5 >= rotate_at and p7 >= rotate_at:
             which = "5h and weekly"
-        if pinned and pinned == tok and not state_note(cur).startswith(
-                ("EXTRA", "unauthorized", "forbidden", "rate")):
+        if pinned and pinned == pin_id(tok) and pin_holds(cur):
             # Held because a person chose it. The pin lifts only when the credential can no longer
             # serve a request at all; below that, protecting the choice is the whole point.
             if not pin_said:
@@ -2975,7 +2998,7 @@ def main() -> int:
                         continue
                     read_live()
                     msg += sync_creds()
-                    pinned = store.token(row)          # a hand-made choice auto-rotate must keep
+                    pinned = pin_id(store.token(row))  # a hand-made choice auto-rotate must keep
                     _st = load_state()
                     _st["pinned"] = pinned
                     save_state(_st)
