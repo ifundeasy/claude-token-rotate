@@ -11,7 +11,9 @@ Shell behaviour is checked by actually running zsh with a value already in the e
 is the only way to catch the failure this suite exists for: commenting an `export` out looks
 correct in the file and does nothing to a shell that inherited the variable from its parent.
 """
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -276,12 +278,155 @@ def test_park_mode(d: str) -> None:
     check("z then hands over the parked pick", shell_sees(rc) == tok("P"))
 
 
+LOGIN = {"accessToken": "sk-ant-oat01-LOGIN-ACCESS", "refreshToken": "sk-ant-ort01-LOGIN-REFRESH",
+         "expiresAt": 1, "scopes": ["user:inference", "user:profile"],
+         "subscriptionType": "team", "rateLimitTier": "default_claude_max"}
+MCP = {"linear|x": {"serverName": "linear", "accessToken": ""}}
+
+
+def creds_with(d: str, name: str, block: object) -> str:
+    path = os.path.join(d, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"mcpOAuth": MCP, "claudeAiOauth": block}, fh)
+    return path
+
+
+def creds_block(path: str) -> dict[str, object]:
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_creds_follow(d: str) -> None:
+    """The credentials file carries the injected token while on, and the exact /login while off."""
+    path = creds_with(d, "creds1.json", LOGIN)
+    parked = path + m.CREDS_LOGIN
+
+    m.creds_inject(path, tok("A"))
+    doc = creds_block(path)
+    o = doc["claudeAiOauth"]
+    check("inject: the token is in claudeAiOauth", o["accessToken"] == tok("A"))
+    check("inject: no refresh token, so nothing refreshes it back", o["refreshToken"] is None)
+    check("inject: expiry far enough out that it is never refreshed",
+          o["expiresAt"] > (time.time() + 300 * 86400) * 1000)
+    check("inject: plan fields carried over from the login", o.get("subscriptionType") == "team")
+    check("inject: other keys untouched", doc["mcpOAuth"] == MCP)
+    check("inject: the login is parked verbatim", creds_block(parked)["claudeAiOauth"] == LOGIN)
+    check("inject: both files are 0600",
+          os.stat(path).st_mode & 0o777 == 0o600 and os.stat(parked).st_mode & 0o777 == 0o600)
+
+    m.creds_inject(path, tok("B"))
+    check("re-inject: swaps the token", creds_block(path)["claudeAiOauth"]["accessToken"] == tok("B"))
+    check("re-inject: the parked login is not replaced by an injected token",
+          creds_block(parked)["claudeAiOauth"] == LOGIN)
+
+    m.creds_restore(path)
+    doc = creds_block(path)
+    check("restore: the /login block is back exactly", doc["claudeAiOauth"] == LOGIN)
+    check("restore: other keys untouched", doc["mcpOAuth"] == MCP)
+    check("restore: nothing left parked", not os.path.exists(parked))
+    before = open(path, encoding="utf-8").read()
+    m.creds_restore(path)
+    check("restore on a login is a no-op", open(path, encoding="utf-8").read() == before)
+
+    # Someone runs /login while a token is injected: that login is newer than the parked one.
+    m.creds_inject(path, tok("A"))
+    fresh = {**LOGIN, "accessToken": "sk-ant-oat01-NEWER-LOGIN", "refreshToken": "sk-ant-ort01-N"}
+    doc = creds_block(path)
+    doc["claudeAiOauth"] = fresh
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    m.creds_restore(path)
+    check("a newer /login is kept, not overwritten by the parked one",
+          creds_block(path)["claudeAiOauth"] == fresh and not os.path.exists(parked))
+
+    lone = creds_with(d, "creds2.json", {"accessToken": tok("S"), "refreshToken": None})
+    before = open(lone, encoding="utf-8").read()
+    try:
+        m.creds_restore(lone)
+        check("no parked login: refuses rather than signing everything out", False)
+    except RuntimeError:
+        check("no parked login: refuses rather than signing everything out",
+              open(lone, encoding="utf-8").read() == before)
+
+    bad = os.path.join(d, "creds3.json")
+    with open(bad, "w", encoding="utf-8") as fh:
+        fh.write("{half a file")
+    try:
+        m.creds_inject(bad, tok("A"))
+        check("refuses to rewrite a file it cannot parse", False)
+    except RuntimeError:
+        check("refuses to rewrite a file it cannot parse",
+              open(bad, encoding="utf-8").read() == "{half a file")
+
+    fresh_file = os.path.join(d, "creds4.json")
+    m.creds_sync(fresh_file, tok("A"), active=True)
+    check("sync on: creates the file when there is none",
+          creds_block(fresh_file)["claudeAiOauth"]["accessToken"] == tok("A"))
+    synced = creds_with(d, "creds5.json", LOGIN)
+    m.creds_sync(synced, tok("A"), active=True)
+    m.creds_sync(synced, tok("A"), active=False)
+    check("sync off: back to the login", creds_block(synced)["claudeAiOauth"] == LOGIN)
+
+
+STATUSLINE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "plugin", "statusline_command.md")
+
+
+def account_cell(cfg: str, csv: str, env_tok: str = "") -> str:
+    """The account cell (row 2, column 1) for a session configured by `cfg`.
+
+    Run under a bash that has no token in its own environment, because the script falls back to
+    its parent's /proc environ — and this suite's parent may well be a shell exporting a real one.
+    """
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": cfg,
+           "CLAUDE_CONFIG_DIR": cfg, "STATUSLINE_TOKEN_CSV": csv}
+    if env_tok:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = env_tok
+    payload = json.dumps({"model": {"display_name": "Opus"}})
+    out = subprocess.run(["bash", "-c", f"{STATUSLINE!r}; true"], input=payload, env=env,
+                         capture_output=True, text=True).stdout
+    rows = [re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in out.splitlines()]
+    return rows[1].split("│")[0].strip() if len(rows) > 1 else ""
+
+
+def test_statusline_account(d: str) -> None:
+    """The account cell names the credential in use: its CSV name, or the /login email."""
+    cfg = os.path.join(d, "slcfg")
+    os.makedirs(cfg)
+    with open(os.path.join(cfg, ".claude.json"), "w", encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"emailAddress": "me@example.com"}}, fh)
+    csv = os.path.join(d, "sl.csv")
+    with open(csv, "w", encoding="utf-8") as fh:
+        fh.write(f"Note,CLAUDE_CODE_OAUTH_TOKEN,Name\nx,{tok('A')},alice\ny,{tok('B')},bob\n")
+    creds = os.path.join(cfg, ".credentials.json")
+
+    with open(creds, "w", encoding="utf-8") as fh:
+        json.dump({"claudeAiOauth": LOGIN}, fh)
+    check("statusline: /login shows the email", account_cell(cfg, csv) == "me@example.com")
+
+    m.creds_inject(creds, tok("A"))
+    check("statusline: an injected token shows its CSV name",
+          account_cell(cfg, csv) == f"alice sk...{tok('A')[-8:]}")
+
+    m.creds_inject(creds, tok("Q"))
+    check("statusline: an injected token outside the CSV keeps the Token label",
+          account_cell(cfg, csv) == f"Token sk...{tok('Q')[-8:]}")
+
+    check("statusline: the session's own variable wins over the file",
+          account_cell(cfg, csv, env_tok=tok("B")) == f"bob sk...{tok('B')[-8:]}")
+
+    os.unlink(creds)
+    check("statusline: no credentials file falls back to the email",
+          account_cell(cfg, csv) == "me@example.com")
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
         for fn in (test_disable_beats_inheritance, test_parked_injection,
                    test_both_windows_decide, test_file_handling, test_refusals,
-                   test_session_detection, test_pick_rules, test_park_mode):
+                   test_session_detection, test_pick_rules, test_park_mode,
+                   test_creds_follow, test_statusline_account):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

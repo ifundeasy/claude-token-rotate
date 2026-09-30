@@ -1,10 +1,16 @@
 # claude-token-rotate
 
 Keeps Claude Code working across a pool of credentials: watches every account's 5h, weekly and
-usage-credit quota, and swaps the token in your shell before the active one runs dry.
+usage-credit quota, and swaps the token — in your shell **and** in Claude Code's credentials file —
+before the active one runs dry.
 
 One Python file, **standard library only** — no `pip install`, no build step, no third-party
 dependencies.
+
+> **Linux only. Tested on Ubuntu, nowhere else.** macOS is not supported: Claude Code keeps its
+> login in the Keychain there, not in `~/.claude/.credentials.json`, so the token swap has nothing
+> to write to (the tool skips it on macOS). Windows is not supported at all. The statusline and the
+> in-use warning also read `/proc`, which only Linux has.
 
 ```
 ╭ CLAUDE QUOTA · 5h + 7d + extra credits ───────────── 00:00:16 · csv · 60s · 7 probes ╮
@@ -88,13 +94,14 @@ survive a rewrite, and rows with an empty token are skipped. Use `--csv PATH` fo
 ## Token rotation
 
 One credential is the one your shell actually exports. The dashboard marks it **cyan** in the NAME
-column and can change it.
+column and can change it. Every change to it is written to **two places at once** — `~/.zshenv`
+and `~/.claude/.credentials.json` — see [The credentials file follows](#the-credentials-file-follows).
 
 | How | Behaviour |
 |---|---|
-| **Manual** (`t`) | pick a row, or leave blank for the freshest → confirm → write → offered `claude daemon stop --any` |
+| **Manual** (`t`) | pick a row, or leave blank for the freshest → confirm → write both files → offered `claude daemon stop --any` |
 | **Auto** (`T`) | cycles three ways — see below |
-| **Off** (`z`) | comments the `export` line out *and* writes an explicit `unset`; press again to re-enable |
+| **Off** (`z`) | comments the `export` line out *and* writes an explicit `unset`, and puts your `/login` back in the credentials file; press again to re-enable |
 
 Auto mode **never** touches the supervisor. Stopping it terminates live sessions — that is a
 decision a person makes, not a timer.
@@ -157,12 +164,62 @@ value, so turning it back on hands you the best credential rather than whatever 
 — but it never re-enables the line. Only `t` does that, and `t` is the deliberate override: it
 ignores the threshold and switches the variable on, saying so when that was a change.
 
+### The credentials file follows
+
+Running Claude Code sessions **re-read `~/.claude/.credentials.json` before every request**. That
+is not documented anywhere; it was measured (Claude Code 2.1.285, a long-running session pointed at
+a local stub API): the request right after the file changed already carried the new token. So the
+file is the one path that reaches a session that is **already open**, and every write that changes
+`~/.zshenv` changes it too:
+
+| Trigger | `~/.zshenv` | `~/.claude/.credentials.json` |
+|---|---|---|
+| `t` inject | writes the token, switched on | `claudeAiOauth` → that token |
+| `z` off | comments it out + `unset` | `claudeAiOauth` → your `/login`, exactly as it was |
+| `z` on | re-enables the export | `claudeAiOauth` → the exported token |
+| auto-rotate `on` | writes the pick, keeps the on/off state | follows that state |
+| auto-rotate `park` | writes the pick switched off | `/login` |
+| `e` edit a live token | rewrites the value | follows it |
+
+The rule is one sentence: **while the variable is on, the file holds the same token; while it is
+off, the file holds your `/login`.** Only the `claudeAiOauth` block changes — MCP logins and every
+other key in the file are written back untouched.
+
+**What an injected block looks like.** The token, **no refresh token**, and an expiry a year out
+(what `claude setup-token` mints). Without a refresh token Claude Code never tries to refresh it —
+and a refresh is exactly what would quietly swap your `/login` back in behind the tool's back. The
+plan fields (`subscriptionType`, `rateLimitTier`) are carried over from the login.
+
+**Your `/login` is parked, not lost.** Before the first injection the login block is copied to
+`~/.claude/.credentials.json.claude_token_rotate.login` (0600 — it holds the refresh token), and
+switching off copies it back verbatim and deletes the parked copy. Injecting over an injected
+token keeps the login parked earlier; it is never replaced by a token that is already in the CSV.
+
+Two cases where switching off does **not** restore:
+
+- **You ran `/login` while a token was injected.** That login is newer than the parked one, so it
+  is kept and the parked copy is dropped.
+- **There is no parked login** (the file held an injected token before this tool ever saw a
+  login). Switching off then refuses and says so, and the injected token stays: removing the only
+  working credential would sign every running session out with nothing to fall back on. Run
+  `/login` in Claude Code once and the next injection parks it.
+
+**The variable beats the file.** A session whose own environment carries
+`CLAUDE_CODE_OAUTH_TOKEN` authenticates with that and ignores the file entirely (measured: same
+stub, the file swapped twice, every request still carried the variable). So the live swap reaches
+sessions started **without** the variable. With `shell/zsh-autoreload.zsh` installed and the
+variable on, every new `claude` inherits it — those sessions follow a swap only after a restart.
+
+`--no-creds-write` leaves the file alone (shell file only), `--creds-file PATH` points elsewhere,
+and `--no-env-write` blocks both. On macOS the file is skipped automatically.
+
 ### What you need to know
 
-**A rotation does not reach processes that are already running.** A shell reads its rc at startup,
-and the Claude Code supervisor hands its own credential to every background session it owns. Until
-that supervisor restarts, the swap is invisible to exactly the sessions that matter. That is why
-`t` offers to run `claude daemon stop --any`.
+**A rotation does not reach processes that inherited the old variable.** A shell reads its rc at
+startup, and the Claude Code supervisor hands its own credential to every background session it
+owns. Until that supervisor restarts, the swap is invisible to exactly the sessions that matter.
+That is why `t` offers to run `claude daemon stop --any`. Sessions running on the credentials file
+instead follow the swap on their next request.
 
 **Switching off writes `unset`, not just a `#`.** Commenting the export out removes the assignment
 but cannot remove an *inheritance*. A desktop session freezes the variable into its own environment
@@ -238,14 +295,15 @@ old value.
 | Your shell | **No** — the hook re-reads the file in place |
 | A new `claude` started from that shell | **No** — it inherits the current value |
 | The supervisor and its background sessions | Yes, but only the supervisor: `claude daemon stop --any` |
-| The interactive session you are sitting in | **Yes** — nothing can change it |
+| An open session **without** the variable in its environment | **No** — it re-reads `.credentials.json` on the next request |
+| An open session **with** the variable in its environment | **Yes** — nothing can change it |
 
 The last row is an operating-system guarantee, not a limitation of this tool. A process receives a
 *copy* of the environment when it is exec'd, and nothing outside it can alter that copy. Node reads
 it into `process.env` at startup as well, so even writing to `/proc/<pid>/environ` would change
 nothing the session looks at.
 
-So the shortest path after a rotation, without closing a single terminal:
+So the shortest path after a rotation, for sessions that inherited the variable:
 
 ```bash
 claude daemon stop --any     # the supervisor picks up the new token
@@ -263,9 +321,12 @@ python3 main.py --env-file ~/.bashrc
 
 ### Safeguards
 
-- `--no-env-write` disables all writing; `t` `z` `T` become read-only
+- `--no-env-write` disables all writing, credentials file included; `t` `z` `T` become read-only
+- `--no-creds-write` keeps the shell file behaviour and leaves `.credentials.json` alone
 - Refuses to write when more than one `export` line is active — guessing would be worse
-- Atomic writes (temp file then `os.replace`), original file mode preserved
+- Refuses to rewrite a `.credentials.json` that is not valid JSON
+- Atomic writes (temp file then `os.replace`), original file mode preserved; the credentials file
+  and the parked login are always 0600
 - Symlinks are followed to their target, so a dotfiles repo is not detached
 - Token values are never printed to the screen
 
@@ -277,11 +338,28 @@ python3 main.py --env-file ~/.bashrc
 
 ```
 Opus 5 (1M context) xhigh │ Dirs +0 · 14:30:00   │ Context 414.2k/1M · 41% │ Hourly 13% · 12 Sep 01:10
-Token sk...3zR8nAAA       │ Session 414.2k (99%) │  ⚠ $12.80 · $0.04/min   │ Weekly 27% · 15 Sep 23:00
+carol sk...3zR8nAAA       │ Session 414.2k (99%) │  ⚠ $12.80 · $0.04/min   │ Weekly 27% · 15 Sep 23:00
 ```
 
-The **Token** cell is what ties this to the dashboard: it shows the tail of the live
-`CLAUDE_CODE_OAUTH_TOKEN`, so you can see which credential is in use without opening anything.
+The **account** cell (row two, first column) is what ties this to the dashboard. It names the
+credential **this session** is using, and works it out on every render:
+
+| The session authenticates with | The cell shows |
+|---|---|
+| a token in its own environment, listed in `token.csv` | `carol sk...3zR8nAAA` — its name and tail |
+| an injected token in `.credentials.json`, listed in `token.csv` | `carol sk...3zR8nAAA` |
+| either of the above, **not** in `token.csv` | `Token sk...3zR8nAAA` |
+| your `/login` | `you@example.com` |
+
+The order matches Claude Code's own: a variable in the session's environment wins, then the
+credentials file. The file is re-read every render, so after a swap the cell follows within one
+`refreshInterval`. An injected block is told from a `/login` by its shape — a `/login` always has a
+refresh token behind it, an injected token never does.
+
+The name comes from `token.csv` beside the plugin directory (`STATUSLINE_TOKEN_CSV` overrides the
+path), matched on the full token by the header's `Name` and `CLAUDE_CODE_OAUTH_TOKEN` columns in any
+order. The token never leaves `jq`: it goes in through the environment, not argv, and only the
+name and the masked tail come back out.
 
 The file is named `.md` but contains bash. Execution is decided by the `#!/bin/bash` shebang, not
 the extension, so it runs — the trade-off is that editors treat it as Markdown and shell syntax
@@ -289,7 +367,7 @@ highlighting is lost.
 
 ### How to run it
 
-Needs `jq` and `sed`. The script reads its JSON payload from **stdin**, so to try it:
+Needs `jq` 1.6+ (for `--rawfile` and `$ENV`) and `sed`. The script reads its JSON payload from **stdin**, so to try it:
 
 ```bash
 echo '{"model":{"display_name":"Opus 5"},"context_window":{"context_window_size":200000,
@@ -387,7 +465,9 @@ alias ctr='python3 /path/to/claude-token-rotate/main.py'
 | `--env-file PATH` | shell file to manage (default `~/.zshenv`) |
 | `--rotate-at PCT` | auto-swap threshold, applied to both the 5h and the weekly window (default 75) |
 | `--auto-rotate` | start with auto-swap on |
-| `--no-env-write` | never write a shell file |
+| `--no-env-write` | never write a shell file (nor the credentials file) |
+| `--creds-file PATH` | Claude Code credentials file kept in step (default `~/.claude/.credentials.json`, or under `$CLAUDE_CONFIG_DIR`) |
+| `--no-creds-write` | leave the credentials file alone; only the shell file follows `t` `z` `T` |
 | `--no-notify` | no desktop notification when the live credential is still in use |
 | `--diagnose NAME` | test both paths (API and `claude -p`) for one credential |
 | `--once` `--json` | one snapshot · as JSON |
@@ -402,6 +482,8 @@ alias ctr='python3 /path/to/claude-token-rotate/main.py'
 | `token.csv` (+ `.bak`) | on `a` / `d` / `e` |
 | `data.json` | cap cache and auto-swap setting (SHA-256 prefixes, **not** tokens) |
 | `~/.zshenv` (+ `.claude_token_rotate.bak`, `.claude_token_rotate.orig`) | on `t` / `z` / auto-swap |
+| `~/.claude/.credentials.json` — the `claudeAiOauth` block only | on `t` / `z` / auto-swap, together with `~/.zshenv` (Linux only) |
+| `~/.claude/.credentials.json.claude_token_rotate.login` | your parked `/login` while a token is injected; removed on restore |
 | `dist/`, `.build/` | only on `./build.sh` |
 | `~/.claude/settings.json` | only if you install the statusline yourself |
 
@@ -416,8 +498,9 @@ the clipboard.
 python3 tests/run.py
 ```
 
-Standard library only, no framework. Every case builds its own CSV and shell rc in a temp
-directory — nothing touches a real file. Shell behaviour is verified by running `zsh` with the
+Standard library only, no framework. Every case builds its own CSV, shell rc and credentials file
+in a temp directory — nothing touches a real file. The statusline cases run the real script
+against a temp `CLAUDE_CONFIG_DIR`. Shell behaviour is verified by running `zsh` with the
 variable already set in the environment, which is the only way to catch the failure the suite
 exists for: commenting an `export` out looks right in the file and does nothing to a shell that
 inherited the value from its parent.

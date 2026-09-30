@@ -103,11 +103,19 @@ version, rewritten every time, and `.claude_token_rotate.orig` is what the file 
 tool first touched it, written once and never again. Auto-rotate can write several times an hour,
 so a single rolling backup would not be enough to get the original back.
 
-WHAT A ROTATION DOES NOT DO. It does not reach processes that are already running. A shell reads
-its rc at startup, and the Claude Code supervisor hands its own credential to every background
-session it owns, so until that supervisor restarts the swap is invisible to exactly the sessions
-that matter. `t` offers to run `claude daemon stop --any` for you; auto-rotate never does, because
-stopping the supervisor terminates live sessions and a timer should not make that call.
+THE CREDENTIALS FILE FOLLOWS. Every write that changes the shell file — `t`, `z`, auto-rotate, a
+token edit — also brings `~/.claude/.credentials.json` in line: while the variable is on, its
+`claudeAiOauth` block holds the same token; while it is off, the /login block is back exactly as it
+was. The login is parked beside the file (`.claude_token_rotate.login`, 0600) for as long as a
+token stands in for it, and every other key in the file is written back untouched. Running Claude
+Code sessions re-read that file before each request, so this is the one path that reaches a session
+already open — provided it did not inherit the variable, which wins over the file.
+
+WHAT A ROTATION DOES NOT DO. It does not reach a process that inherited the old variable. A shell
+reads its rc at startup, and the Claude Code supervisor hands its own credential to every
+background session it owns, so until that supervisor restarts the swap is invisible to exactly the
+sessions that matter. `t` offers to run `claude daemon stop --any` for you; auto-rotate never does,
+because stopping the supervisor terminates live sessions and a timer should not make that call.
 
 Tokens are never printed: the table shows a redacted form, and copy actions put the full value on
 the clipboard. Every write to the CSV leaves a `.bak` beside it first. A `data.json`
@@ -127,7 +135,8 @@ USAGE
     python3 main.py --auto-rotate                # swap credentials unattended past the threshold
     python3 main.py --rotate-mode park           # keep the pick fresh, never switch it on
     python3 main.py --rotate-at 60 --env-file ~/.bashrc
-    python3 main.py --no-env-write               # never touch a shell file
+    python3 main.py --no-env-write               # never touch a shell file (nor credentials)
+    python3 main.py --no-creds-write             # shell file only, leave credentials.json alone
     python3 main.py --no-notify                  # no banner when the live token is still in use
     python3 main.py --from-env ../outline-audit/.env
 
@@ -484,7 +493,11 @@ def probe_all(store: Store, tokens: list[str], timeout: float) -> dict[str, dict
 # --------------------------------------------------------------------------- exact usage (/usage)
 
 USAGE_SCOPE = "user:profile"            # /api/oauth/usage refuses anything without it
-LOCAL_CREDS = os.path.expanduser("~/.claude/.credentials.json")
+LOCAL_CREDS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"),
+                           ".credentials.json")
+#: The /login block, parked while an injected token stands in for it. Beside the credentials file
+#: and 0600 like it, because it holds that login's refresh token.
+CREDS_LOGIN = ".claude_token_rotate.login"
 KEYCHAIN_SVC = "Claude Code-credentials"
 
 
@@ -513,11 +526,15 @@ def local_oauth_token() -> str | None:
     is ORG-WIDE, so one token in the org prices the whole table.
     """
     blobs: list[str] = []
-    try:
-        with open(LOCAL_CREDS, encoding="utf-8") as fh:
-            blobs.append(fh.read())
-    except OSError:
-        pass
+    # The parked /login block comes second: while a token is injected it is the only place the
+    # login still exists. Its access token is not refreshed while parked, so it answers for hours,
+    # not days — the cached cap in data.json covers the rest.
+    for path in (LOCAL_CREDS, LOCAL_CREDS + CREDS_LOGIN):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                blobs.append(fh.read())
+        except OSError:
+            pass
     if sys.platform == "darwin":          # macOS keeps the login in the Keychain, not on disk
         try:
             out = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SVC, "-w"],
@@ -1017,6 +1034,129 @@ def env_toggle(path: str) -> tuple[str, bool]:
     env_write(path, lines)
     what = "disabled" if was_active else "enabled"
     return f"{TOKEN_COL} {what} in {os.path.basename(path)}", not was_active
+
+
+# --------------------------------------------------------------------------- the credentials file
+
+#: How long an injected token is declared valid. `claude setup-token` mints for a year, and the
+#: real expiry is not in the token, so this only has to be far enough out that Claude Code never
+#: decides to refresh it — a refresh would need a refresh token, and an injected one has none.
+CREDS_TTL = 365 * 86400
+
+
+def creds_injected(block: object) -> bool:
+    """True for a block this tool wrote: an access token with no refresh token behind it.
+
+    A /login always carries a refresh token, and a logged-out file carries no access token, so
+    the shape alone says which is which — no marker has to survive Claude Code rewriting the file.
+    """
+    return (isinstance(block, dict) and bool(block.get("accessToken"))
+            and not block.get("refreshToken"))
+
+
+def creds_read(path: str) -> dict[str, object]:
+    """The whole credentials document. Missing reads as empty; unparseable refuses."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+    except FileNotFoundError:
+        return {}
+    try:
+        doc = json.loads(body) if body.strip() else {}
+    except ValueError:
+        raise RuntimeError(f"{os.path.basename(path)} is not valid JSON — refusing to rewrite it")
+    if not isinstance(doc, dict):
+        raise RuntimeError(f"{os.path.basename(path)} is not a JSON object — refusing to rewrite it")
+    return doc
+
+
+def creds_write(path: str, doc: dict[str, object]) -> None:
+    """Atomic replace at 0600. Claude Code rewrites this file too, so the window must be one rename."""
+    real = os.path.realpath(path)
+    d = os.path.dirname(os.path.abspath(real)) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".claude_token_rotate.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, real)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def creds_inject(path: str, token: str) -> str:
+    """Put `token` in the file's `claudeAiOauth` block, parking the /login block it replaces.
+
+    Running sessions re-read this file before each request, so unlike the shell file this DOES
+    reach a session that is already open — any session that did not inherit the variable, which
+    wins over the file. Every other key (MCP logins and the like) is written back untouched.
+
+    Only a block this tool did not write is parked: injecting over an injected token must keep the
+    login parked earlier, not replace it with a token that is already in the CSV.
+    """
+    if not token or not token.startswith("sk-ant-oat"):
+        raise RuntimeError("not an OAuth token (expected sk-ant-oat…)")
+    doc = creds_read(path)
+    cur = doc.get("claudeAiOauth")
+    if creds_injected(cur) and cur.get("accessToken") == token:
+        return f"{os.path.basename(path)} already on {redact(token)}"
+    login = cur if isinstance(cur, dict) and not creds_injected(cur) else None
+    if login is not None:
+        creds_write(path + CREDS_LOGIN, {"claudeAiOauth": login})
+    else:
+        try:
+            login = creds_read(path + CREDS_LOGIN).get("claudeAiOauth")
+        except RuntimeError:
+            login = None
+    src = login if isinstance(login, dict) else cur if isinstance(cur, dict) else {}
+    block: dict[str, object] = {
+        "accessToken": token,
+        "refreshToken": None,
+        "expiresAt": int((time.time() + CREDS_TTL) * 1000),
+        "scopes": ["user:inference"],          # what `claude setup-token` mints
+    }
+    for k in ("subscriptionType", "rateLimitTier"):
+        if src.get(k):
+            block[k] = src[k]
+    doc["claudeAiOauth"] = block
+    creds_write(path, doc)
+    return f"{os.path.basename(path)} → {redact(token)}"
+
+
+def creds_restore(path: str) -> str:
+    """Put the parked /login block back, exactly as it was parked.
+
+    Nothing is restored over a login that is already there: if someone ran /login while a token was
+    injected, that login is newer than the parked one, and the parked copy is simply dropped.
+    With nothing parked, the injected token is left in place and this refuses — deleting the only
+    working credential would sign every running session out, with no login to fall back on.
+    """
+    doc = creds_read(path)
+    cur = doc.get("claudeAiOauth")
+    parked = path + CREDS_LOGIN
+    if not creds_injected(cur):
+        if os.path.exists(parked):
+            os.unlink(parked)
+        return f"{os.path.basename(path)} already on the /login credential"
+    try:
+        login = creds_read(parked).get("claudeAiOauth")
+    except RuntimeError:
+        login = None
+    if not isinstance(login, dict):
+        raise RuntimeError(f"no parked /login in {os.path.basename(path)} — run /login in "
+                           f"Claude Code; the injected token stays until then")
+    doc["claudeAiOauth"] = login
+    creds_write(path, doc)
+    os.unlink(parked)
+    return f"{os.path.basename(path)} → /login restored"
+
+
+def creds_sync(path: str, token: str, active: bool) -> str:
+    """Make the credentials file follow the shell file: its token while on, the /login while off."""
+    return creds_inject(path, token) if active and token else creds_restore(path)
 
 
 #: A Claude Code session runs as `claude`, or as the versioned launcher the installer drops in
@@ -2390,6 +2530,11 @@ def main() -> int:
                          "on: keep it fresh and leave the on/off state alone")
     ap.add_argument("--no-env-write", action="store_true",
                     help="never write the shell file — the t/T/z keys become read-only")
+    ap.add_argument("--creds-file", metavar="PATH", default=LOCAL_CREDS,
+                    help="Claude Code credentials file kept in step with the shell file "
+                         f"(default {LOCAL_CREDS.replace(os.path.expanduser('~'), '~')})")
+    ap.add_argument("--no-creds-write", action="store_true",
+                    help="leave the credentials file alone — only the shell file follows t/T/z")
     ap.add_argument("--no-notify", action="store_true",
                     help="no desktop notification when the live credential crosses the threshold "
                          "while sessions on this machine are still using it")
@@ -2430,6 +2575,9 @@ def main() -> int:
     rotate_at = max(1.0, min(100.0, args.rotate_at))
     env_path = os.path.expanduser(args.env_file)
     env_ok = not args.no_env_write
+    creds_path = os.path.expanduser(args.creds_file)
+    # macOS keeps the login in the Keychain, so a file there is not what Claude Code reads.
+    creds_ok = env_ok and not args.no_creds_write and sys.platform != "darwin"
     _saved = load_state()
     if args.rotate_mode:
         auto_rotate = args.rotate_mode
@@ -2458,6 +2606,20 @@ def main() -> int:
         LIVE["auto"] = auto_rotate
         LIVE["writable"] = env_ok
         LIVE["rotate_at"] = rotate_at
+
+    def sync_creds() -> str:
+        """Bring the credentials file in line with the shell file just written, as a flash suffix.
+
+        Called only after this tool writes the shell file — never on a refresh, which would undo a
+        /login made by hand. Runs off LIVE, so read_live() must come first.
+        """
+        if not creds_ok or LIVE.get("err") or int(LIVE.get("idx", -1)) < 0:
+            return ""
+        try:
+            return " · " + creds_sync(creds_path, str(LIVE.get("token") or ""),
+                                      bool(LIVE.get("active")))
+        except (RuntimeError, OSError) as exc:
+            return f" · {os.path.basename(creds_path)} not updated: {exc}"
 
     def record(results: dict) -> None:
         """History for the trend columns, and the reason behind any drop in a window.
@@ -2598,7 +2760,7 @@ def main() -> int:
                         f"credential is under {rotate_at:.0f}% on both windows — staying put")
             return ""
         row, p = pick
-        old, was_on = LIVE.get("name"), bool(LIVE.get("active"))
+        old = LIVE.get("name")
         try:
             # `park` writes it switched off on purpose; `on` keeps the file's own state, because
             # refreshing a parked value is housekeeping and switching it on would overrule the
@@ -2611,9 +2773,11 @@ def main() -> int:
             return f"auto-rotate OFF — write failed: {exc}"
         last_rotate, no_cand_said = time.time(), False
         read_live()
+        synced = sync_creds()
         return (f"↻ auto-rotate: {old} {now:.0f}% ({which}) → {store.name(row)} {p:.0f}% · "
-                + ("restart Claude Code clients to pick it up" if was_on
-                   else f"still switched off — z activates it"))
+                + ("sessions started with the variable keep the old one until restarted"
+                   if LIVE.get("active") else "switched off — z activates it")
+                + synced)
 
     read_live()
 
@@ -2810,6 +2974,7 @@ def main() -> int:
                         flash = f"not written: {exc}"
                         continue
                     read_live()
+                    msg += sync_creds()
                     pinned = store.token(row)          # a hand-made choice auto-rotate must keep
                     _st = load_state()
                     _st["pinned"] = pinned
@@ -2848,7 +3013,7 @@ def main() -> int:
                         flash = f"not changed: {exc}"
                         continue
                     read_live()
-                    flash = msg + " · restart Claude Code clients to pick it up"
+                    flash = msg + sync_creds() + " · sessions started with the variable need a restart"
                 elif key == "a":
                     if store.readonly:
                         flash = "list is read-only (--from-env)"
@@ -2961,7 +3126,10 @@ def main() -> int:
                                 flash += " · " + env_set(env_path, store, new_tok)
                             except (RuntimeError, OSError) as exc:
                                 flash += f" · shell file not updated: {exc}"
-                            read_live()
+                                read_live()
+                            else:
+                                read_live()
+                                flash += sync_creds()
     except KeyboardInterrupt:
         pass
     finally:

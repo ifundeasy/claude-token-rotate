@@ -22,7 +22,8 @@
 # here is estimated or faked. Two things are sourced elsewhere because that JSON
 # does not carry them (verified against a live payload: it has no auth fields at
 # all): the account identity (CLAUDE_CODE_OAUTH_TOKEN when the environment sets
-# one, else the login email from the CLI's own config file) and the caveman mode
+# one, else whatever the credentials file holds — an injected token by its
+# token.csv name, a /login by its email) and the caveman mode
 # badge (read from the plugin's own flag file, same as it would render if it
 # owned the statusline).
 #
@@ -38,12 +39,11 @@
 # hundred string operations, and every $( ) around one of them costs more than
 # all of them together. So one jq call formats every numeric/time value, the grid
 # below assembles each cell exactly once, and padding uses `printf -v` rather
-# than command substitution. The account block's second jq is the deliberate
-# exception: it reads a file other tooling rewrites in place, so it must be able
-# to fail on its own without taking the render down with it. Measured 5x on this
-# machine: ~23ms per render on the token path, ~34ms on the email path (the
-# email path pays for both the /proc scan and the config read; the token path
-# stops as soon as it has the token).
+# than command substitution. The account block's own jq calls are the deliberate
+# exception: they read files other tooling rewrites in place, so they must be
+# able to fail on their own without taking the render down with it. The token
+# path costs one of them (credentials + token.csv), the /login path two (the
+# email lives in a separate, much larger config file).
 
 input=$(cat)
 
@@ -114,6 +114,17 @@ fi
 # On a host without /proc an env-token session is indistinguishable from a stored
 # login, and this falls back to the email.
 #
+# Without that variable, the session authenticates from the credentials file —
+# and claude-token-rotate puts an injected token there too, which a running
+# session picks up on its next request. So the file is read on every render and
+# its claudeAiOauth block decides: a refresh token behind the access token is a
+# /login (show the email), none is an injected token (show its name).
+#
+# The name comes from the rotator's token.csv (STATUSLINE_TOKEN_CSV, else the one
+# beside this plugin directory): the row whose token matches, by the header's
+# Name and CLAUDE_CODE_OAUTH_TOKEN columns, in whatever order they sit. A token
+# with no row keeps the old "Token" label rather than a guess.
+#
 # The token renders as <first2>...<last STATUSLINE_TOKEN_TAIL>: the tail is what
 # actually tells two tokens apart, the head being a fixed public prefix. One too
 # short to keep head, tail and elision distinct shows "hidden" instead of
@@ -137,20 +148,53 @@ else
     [ -n "$acct_secret" ] && break
   done
 fi
-if [ -n "$acct_secret" ]; then
-  if [ "${#acct_secret}" -gt $(( tok_tail + 4 )) ]; then
-    acct_val="${acct_secret:0:2}...${acct_secret: -${tok_tail}}"
-  else
-    acct_val="hidden"
-  fi
-  acct_secret=""
+
+acct_src="${BASH_SOURCE[0]}"
+[ -L "$acct_src" ] && acct_src=$(readlink -f "$acct_src")
+acct_csv="${STATUSLINE_TOKEN_CSV:-${acct_src%/*}/../token.csv}"
+[ -r "$acct_csv" ] || acct_csv=/dev/null
+acct_creds="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+[ -r "$acct_creds" ] || acct_creds=/dev/null
+# One guarded jq, separate from the big call below: both files get rewritten in
+# place by other tooling, so a half-written read must cost this one cell, never
+# the whole render. The secret reaches jq through its environment (readable by
+# this user only), never argv (readable by everyone in /proc/<pid>/cmdline), and
+# only the kind, the name and the masked form come back out.
+IFS=$'\x1f' read -r acct_kind acct_name acct_val <<< "$(
+  CTR_TOK="$acct_secret" jq -rn --rawfile csv "$acct_csv" --rawfile creds "$acct_creds" \
+    --argjson tail "$tok_tail" '
+    (try ($creds | fromjson | .claudeAiOauth) catch null) as $o
+    | ($ENV.CTR_TOK // "") as $env
+    | (if $env != "" then [$env, "token"]
+       elif ($o.accessToken? // "") != "" then
+         [$o.accessToken, (if ($o.refreshToken // "") != "" then "login" else "token" end)]
+       else ["", ""] end) as [$tok, $kind]
+    | [ $csv | split("\n")[] | sub("\r$"; "") | select(length > 0)
+        | [ split(",")[] | sub("^\""; "") | sub("\"$"; "") ] ] as $rows
+    | ($rows[0] // []) as $head
+    | ($head | index("Name")) as $ni
+    | ($head | index("CLAUDE_CODE_OAUTH_TOKEN")) as $ti
+    | (if $kind == "token" and $ni != null and $ti != null
+       then first($rows[1:][] | select(.[$ti] == $tok) | .[$ni]) // "" else "" end) as $name
+    | [ $kind, $name,
+        (if $kind != "token" then ""
+         elif ($tok | length) > ($tail + 4) then $tok[0:2] + "..." + $tok[-$tail:]
+         else "hidden" end) ]
+    | join("\u001f")' 2>/dev/null)"
+acct_secret=""
+
+if [ "$acct_kind" = "token" ]; then
   acct_val="${acct_val//[^[:print:]]/}"
-  acct_plain="Token ${acct_val:0:64}"
-  acct_colored="${DIM}Token${RESET} ${acct_val:0:64}"
+  acct_name="${acct_name//[^[:print:]]/}"
+  if [ -n "$acct_name" ]; then
+    acct_plain="${acct_name:0:32} ${acct_val:0:64}"
+    acct_colored="${acct_name:0:32} ${DIM}${acct_val:0:64}${RESET}"
+  else
+    acct_plain="Token ${acct_val:0:64}"
+    acct_colored="${DIM}Token${RESET} ${acct_val:0:64}"
+  fi
 else
-  # Deliberately a separate guarded jq, not folded into the one big call below:
-  # this file is large and gets rewritten in place by other tooling, so a
-  # half-written read must cost this one cell, never the whole render.
+  # The /login path. A separate guarded jq for the same reason as above.
   acct_file="${CLAUDE_CONFIG_DIR:+${CLAUDE_CONFIG_DIR}/.claude.json}"
   [ -n "$acct_file" ] && [ -f "$acct_file" ] || acct_file="$HOME/.claude.json"
   acct_val=$(jq -r '.oauthAccount.emailAddress // empty' "$acct_file" 2>/dev/null)
