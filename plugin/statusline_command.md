@@ -152,6 +152,13 @@ fi
 acct_src="${BASH_SOURCE[0]}"
 [ -L "$acct_src" ] && acct_src=$(readlink -f "$acct_src")
 acct_csv="${STATUSLINE_TOKEN_CSV:-${acct_src%/*}/../token.csv}"
+if [ -z "${STATUSLINE_TOKEN_CSV:-}" ] && [ ! -r "$acct_csv" ]; then
+  # A copy installed away from the repo (~/.claude/statusline-command.sh, say):
+  # the CSV sits beside the rotator itself, which the README puts on PATH as a
+  # symlink to the real file. Two forks, paid only on this fallback.
+  acct_bin=$(command -v claude-token-rotate 2>/dev/null)
+  [ -n "$acct_bin" ] && acct_bin=$(readlink -f "$acct_bin") && acct_csv="${acct_bin%/*}/token.csv"
+fi
 [ -r "$acct_csv" ] || acct_csv=/dev/null
 acct_creds="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 [ -r "$acct_creds" ] || acct_creds=/dev/null

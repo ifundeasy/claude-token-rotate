@@ -356,8 +356,9 @@ credentials file. The file is re-read every render, so after a swap the cell fol
 `refreshInterval`. An injected block is told from a `/login` by its shape — a `/login` always has a
 refresh token behind it, an injected token never does.
 
-The name comes from `token.csv` beside the plugin directory (`STATUSLINE_TOKEN_CSV` overrides the
-path), matched on the full token by the header's `Name` and `CLAUDE_CODE_OAUTH_TOKEN` columns in any
+The name comes from `token.csv`: `STATUSLINE_TOKEN_CSV` if set, else the one beside the plugin
+directory, else the one beside `claude-token-rotate` on `PATH` (the symlink is resolved) — which is
+what lets a copy installed elsewhere find it. It is matched on the full token by the header's `Name` and `CLAUDE_CODE_OAUTH_TOKEN` columns in any
 order. The token never leaves `jq`: it goes in through the environment, not argv, and only the
 name and the masked tail come back out.
 
@@ -382,7 +383,9 @@ echo '{"model":{"display_name":"Opus 5"},"context_window":{"context_window_size"
 token buckets, not a number. Those two are the easiest things to get wrong when assembling a test
 payload by hand.
 
-To install it, point `statusLine` at it in `~/.claude/settings.json`:
+To install it, point `statusLine` at it in `~/.claude/settings.json` — the repo file itself, or a
+copy such as `~/.claude/statusline-command.sh` (a copy has to be refreshed after each update, and
+finds `token.csv` through `claude-token-rotate` on `PATH`):
 
 ```json
 {
