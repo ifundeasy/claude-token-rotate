@@ -49,48 +49,40 @@ Column order does not matter, extra columns are preserved when the file is rewri
 with an empty token are skipped. `--from-env` reads the variables instead of a file, in which case
 the credential list is read-only.
 
-THE LIVE CREDENTIAL. One credential is the one your shell actually exports, and the dashboard both
-shows it (cyan in the NAME column) and can change it. `t` writes a chosen token into the shell file,
-`z` switches that line off and back on, and `T` cycles what auto-rotate is allowed to do.
+THE LIVE CREDENTIAL. One credential is the one Claude Code actually uses, and the dashboard both
+shows it (cyan in the NAME column) and can change it. `t` hands a chosen token over, `z` switches
+back to your /login and forward again, and `T` cycles what auto-rotate is allowed to do.
 
-    trigger     max(5h, weekly) on the live credential >= --rotate-at   (75%)
+    usable      5h < LIMIT_5H (61, so at most 60%)  and  weekly < LIMIT_7D (75)
+    trigger     the live credential is not usable
                 and at least ROTATE_GAP seconds since the last swap
-                and the live credential is not pinned
-
-    candidate   5h     < PICK_5H          (50%)
-                weekly < PICK_7D          (80%)
-                       < PICK_7D_TIGHT    (60%) while >3 WORKING days remain
-                max(5h, weekly) < --rotate-at
-
-    choose      the lowest max(5h, weekly)
+    choose      the usable credential with the lowest max(5h, weekly)
 
 Each window is judged on its own because they say different things. A credential at 4% of its five
-hours and 96% of its week is fresh by the first number and refused on the next request. And the
-weekly test counts WORKING days: Saturdays and Sundays inside the remaining window are subtracted
-before the three-day test, so being near a weekend relaxes the budget rather than tightening it —
-those are the days least likely to spend it.
+hours and 96% of its week is fresh by the first number and refused on the next request. The weekly
+limit is the same whenever the window resets — no weekend or working-day arithmetic.
 
-There is deliberately no "beat the incumbent by N points" margin. The per-window limits already say
-what a sound replacement is, and a margin on top would reject candidates that are plainly fine.
+There is deliberately no "beat the incumbent by N points" margin. The limits already say what a
+sound replacement is, and a margin on top would reject candidates that are plainly fine.
 
 `T` has three positions, because "stop rotating my live credential" and "stop tracking which
 credential is best" are different wishes:
 
     off    the shell file is not touched at all
     park   the best credential is written SWITCHED OFF — recorded, but nothing picks it up
-    on     written, and the file's own on/off state is left alone
+    on     recorded, and made live if a token was live (the current on/off state is kept)
 
 `park` needs the `unset` line as much as the comment does. A terminal inherits the variable from
 the desktop session before it ever reads the file, so commenting the export out alone would leave
 a new session quietly using whichever token was live when the desktop started.
 
-A credential injected by hand is PINNED: auto-rotate will not swap it away at any utilization, and
-the pin lifts only when that credential can no longer serve a request at all. Automation does not
-get to reverse a decision a person made. Injecting another moves the pin, and it survives a
-restart. `t` is forced in the other direction too — its "freshest" pick ignores the candidate
-limits, so it still answers when nothing is comfortable.
+A credential injected by hand is PINNED, and gets one allowance from auto-rotate: when it is over
+the 5h limit and that window resets within the hour (PIN_GRACE), it is kept until PIN_CEILING (95%),
+because the quota is about to come back. A reset further off, a weekly overrun, or a spent
+credential rotates it like any other, and rotating away clears the pin. `t` is forced in the other
+direction too — its "freshest" pick ignores the limits, so it still answers when nothing is usable.
 
-When the live credential crosses the threshold while a Claude Code session ON THIS MACHINE is still
+When the live credential goes past its limits while a Claude Code session ON THIS MACHINE is still
 running on it, one desktop notification says so, once per crossing. Nothing is interrupted: there
 is no supported way to put a message into a running interactive session — the kernel refuses
 keystroke injection into another terminal, writing to its pts only paints over the display, and a
@@ -103,19 +95,22 @@ version, rewritten every time, and `.claude_token_rotate.orig` is what the file 
 tool first touched it, written once and never again. Auto-rotate can write several times an hour,
 so a single rolling backup would not be enough to get the original back.
 
-THE CREDENTIALS FILE FOLLOWS. Every write that changes the shell file — `t`, `z`, auto-rotate, a
-token edit — also brings `~/.claude/.credentials.json` in line: while the variable is on, its
-`claudeAiOauth` block holds the same token; while it is off, the /login block is back exactly as it
-was. The login is parked beside the file (`.claude_token_rotate.login`, 0600) for as long as a
-token stands in for it, and every other key in the file is written back untouched. Running Claude
-Code sessions re-read that file before each request, so this is the one path that reaches a session
-already open — provided it did not inherit the variable, which wins over the file.
+THE CREDENTIALS FILE CARRIES THE TOKEN. Running Claude Code sessions re-read
+`~/.claude/.credentials.json` before each request, so a token written into its `claudeAiOauth` block
+reaches sessions that are already open — no restart. A session that INHERITED
+CLAUDE_CODE_OAUTH_TOKEN ignores the file for the rest of its life, so by default (file mode) the
+shell never hands the variable out: the shell file keeps the token only as a record, written
+switched off with its `unset`, and on/off lives in the credentials file — on is the injected token,
+off is your /login, parked beside the file (`.claude_token_rotate.login`, 0600) and restored exactly
+as it was. Every other key in the file is written back untouched. A token the shell still exports
+when the dashboard starts is moved over once. `--export-env` restores the old behaviour, exporting
+the variable as well; sessions started that way need a restart per swap.
 
-WHAT A ROTATION DOES NOT DO. It does not reach a process that inherited the old variable. A shell
-reads its rc at startup, and the Claude Code supervisor hands its own credential to every
-background session it owns, so until that supervisor restarts the swap is invisible to exactly the
-sessions that matter. `t` offers to run `claude daemon stop --any` for you; auto-rotate never does,
-because stopping the supervisor terminates live sessions and a timer should not make that call.
+WHAT A ROTATION DOES NOT DO. It does not reach a process that inherited the variable — its
+environment was copied at exec and nothing outside it can change that. In file mode that is only
+ever a session started before the switch to it; restart those once. In `--export-env` mode `t`
+offers to run `claude daemon stop --any`; auto-rotate never does, because stopping the supervisor
+terminates live sessions and a timer should not make that call.
 
 Tokens are never printed: the table shows a redacted form, and copy actions put the full value on
 the clipboard. Every write to the CSV leaves a `.bak` beside it first. A `data.json`
@@ -132,11 +127,12 @@ USAGE
     python3 main.py --alert 80                  # bell when a window crosses 80%
     python3 main.py --log usage.csv             # append every reading for later analysis
     python3 main.py --once --json               # one machine-readable snapshot
-    python3 main.py --auto-rotate                # swap credentials unattended past the threshold
+    python3 main.py --auto-rotate                # swap credentials unattended past the limits
     python3 main.py --rotate-mode park           # keep the pick fresh, never switch it on
-    python3 main.py --rotate-at 60 --env-file ~/.bashrc
-    python3 main.py --no-env-write               # never touch a shell file (nor credentials)
-    python3 main.py --no-creds-write             # shell file only, leave credentials.json alone
+    python3 main.py --limit-5h 51 --limit-7d 80  # usable while 5h <= 50% and weekly < 80%
+    python3 main.py --export-env                 # also export the variable (restart per swap)
+    python3 main.py --no-env-write               # never write anything (shell nor credentials)
+    python3 main.py --no-creds-write             # shell file only (implies --export-env)
     python3 main.py --no-notify                  # no banner when the live token is still in use
     python3 main.py --from-env ../outline-audit/.env
 
@@ -183,20 +179,16 @@ REDACT_TAIL = 32                        # trailing characters of a token the tab
 WINDOWS = {"u5h": ("r5h", "5h"), "u7d": ("r7d", "7d"), "uov": ("rov", "extra")}
 #: Where the live credential is exported. `--env-file` points this at another shell file.
 ENV_FILE = os.path.expanduser("~/.zshenv")
-#: Auto-rotate thresholds. A swap needs a candidate that is meaningfully fresher, not merely
-#: fresher by a rounding error, and it needs a floor on how often it may happen — otherwise a
-#: table where everything sits near the threshold would rewrite the shell file every refresh.
-ROTATE_AT = 75.0                        # --rotate-at: 5h utilization that triggers a swap
-ROTATE_GAP = 300.0                      # seconds between automatic swaps
-#: Per-window ceilings a candidate must be under. The five-hour figure is a short-term signal and
-#: the weekly one a budget, so they get separate limits rather than one blended score: a
-#: replacement that is quiet this hour but nearly out of week is not a replacement.
-PICK_5H = 50.0
-PICK_7D = 80.0
-PICK_7D_TIGHT = 60.0
-#: Working days left in the weekly window above which the tighter weekly budget applies. Weekends
-#: do not count: quota is not spent on them, so being near one should not make the budget stricter.
-PICK_WORKDAYS = 3.0
+#: A credential is USABLE while both windows sit under these — the live one is rotated off as soon
+#: as either is reached, and a replacement has to be under both. Utilization is published in whole
+#: percentage points, so 61 means "at most 60%". `--limit-5h` / `--limit-7d` override them.
+LIMIT_5H = 61.0
+LIMIT_7D = 75.0
+ROTATE_GAP = 300.0                      # seconds between automatic swaps, so nothing thrashes
+#: The slack a PINNED credential gets. When its 5h window resets within PIN_GRACE seconds the quota
+#: is about to come back, so it is kept past the limit — until its 5h reaches PIN_CEILING.
+PIN_GRACE = 3600.0
+PIN_CEILING = 95.0
 #: What auto-rotate is allowed to do, cycled with `T`.
 #:   off   write nothing at all
 #:   park  keep the value fresh but never switch it on, so the shell file is a standing
@@ -1159,6 +1151,80 @@ def creds_sync(path: str, token: str, active: bool) -> str:
     return creds_inject(path, token) if active and token else creds_restore(path)
 
 
+def creds_on(path: str) -> bool:
+    """Whether the credentials file holds an injected token (on) rather than the /login (off)."""
+    try:
+        return creds_injected(creds_read(path).get("claudeAiOauth"))
+    except (RuntimeError, OSError):
+        return False
+
+
+def token_name(store: "Store", tok: str) -> str | None:
+    """The CSV name of a token, including rows --only is hiding."""
+    known = getattr(store, "all_rows", None) or store.rows
+    return next((store.name(r) for r in known if store.token(r) == tok), None) if tok else None
+
+
+def _creds_step(fn, *a) -> str:
+    """A credentials-file write as a message suffix: a failure is reported, never raised."""
+    try:
+        return " · " + fn(*a)
+    except (RuntimeError, OSError) as exc:
+        return f" · credentials file not updated: {exc}"
+
+
+def apply_live(env_path: str, creds_path: str, store: "Store", token: str,
+               on: bool | None, file_mode: bool, creds_ok: bool = True) -> str:
+    """Make `token` the live credential. `on` switches it on / off, `None` keeps the current state.
+
+    FILE MODE — the default — writes the shell file only as a RECORD, always switched off with its
+    `unset`, so no process started from a shell ever inherits the variable; the credentials file
+    carries the token instead, and is where on/off lives. That is the whole point: a session that
+    inherited the variable ignores the file until it restarts, while one that did not picks up the
+    file on its next request. Env mode (`--export-env`) exports the variable as well, as before.
+    """
+    if not file_mode:
+        msg = env_set(env_path, store, token, activate=on)
+        if creds_ok:
+            msg += _creds_step(creds_sync, creds_path, token, bool(env_state(env_path)["active"]))
+        return msg
+    msg = env_set(env_path, store, token, activate=False)
+    want = creds_on(creds_path) if on is None else on
+    return msg + _creds_step(creds_inject if want else creds_restore,
+                             *((creds_path, token) if want else (creds_path,)))
+
+
+def toggle_live(env_path: str, creds_path: str, store: "Store", file_mode: bool,
+                creds_ok: bool = True) -> tuple[str, bool]:
+    """Switch the live credential off (back to the /login) or on (the recorded token)."""
+    if not file_mode:
+        msg, on = env_toggle(env_path)
+        if creds_ok:
+            msg += _creds_step(creds_sync, creds_path, str(env_state(env_path)["token"]), on)
+        return msg, on
+    if creds_on(creds_path):
+        return creds_restore(creds_path), False
+    tok = str(env_state(env_path, store)["token"] or "")
+    if not tok:
+        raise RuntimeError(f"no token recorded in {os.path.basename(env_path)} — t picks one")
+    return creds_inject(creds_path, tok), True
+
+
+def migrate_to_file(env_path: str, creds_path: str, store: "Store") -> str:
+    """Move a token the shell still EXPORTS over to the credentials file. "" when there is none.
+
+    The credentials file is written first, so there is no moment in which neither carries it.
+    """
+    st = env_state(env_path, store)
+    tok = str(st.get("token") or "")
+    if not st["active"] or not tok or st["err"] or st["ambiguous"]:
+        return ""
+    creds_inject(creds_path, tok)
+    env_set(env_path, store, tok, activate=False)
+    return (f"{st.get('name') or redact(tok)} moved from {os.path.basename(env_path)} to "
+            f"{os.path.basename(creds_path)} — new sessions follow every swap without a restart")
+
+
 #: A Claude Code session runs as `claude`, or as the versioned launcher the installer drops in
 #: (2.1.282 and friends), and the editor extension runs as `claude` too. Matching on the command
 #: line would sweep in this tool and claude-alert, which merely have "claude" in their names and
@@ -1240,47 +1306,55 @@ def daemon_stop() -> str:
     return "supervisor stopped" if out.returncode == 0 else f"daemon stop exited {out.returncode}"
 
 
-def workdays_left(reset: float | None, now: float | None = None) -> float | None:
-    """Days until a weekly window resets, not counting Saturdays and Sundays.
+BLOCKED = ("EXTRA", "unauthorized", "forbidden", "rate")
 
-    A weekly budget is spent on working days, so the weekend is not time the budget has to cover.
-    Counting it would make the allowance look tighter right before a weekend — backwards, since
-    those are the days least likely to need it.
 
-    Whole weekend DATES inside the span are subtracted from the elapsed-days figure, so the result
-    can go negative when the window ends inside a weekend. That is fine: negative is simply "not
-    more than three", which is the only question asked of it.
+def usable(r: dict[str, object]) -> bool:
+    """Whether a credential may be used: both windows under their limits, and nothing refusing it.
+
+    Each window is judged on its own because they say different things — a credential at 4% of
+    its five hours and 96% of its week is fresh by the first number and refused on the next
+    request. The weekly limit is the same whenever the window resets.
     """
-    if reset is None:
-        return None
-    now = time.time() if now is None else now
-    total = (reset - now) / 86400.0
-    if total <= 0:
-        return 0.0
-    start, end = datetime.date.fromtimestamp(now), datetime.date.fromtimestamp(reset)
-    weekend, day = 0, start
-    while day <= end:
-        weekend += day.weekday() >= 5                   # 5 = Saturday, 6 = Sunday
-        day += datetime.timedelta(days=1)
-    return total - weekend
-
-
-def weekly_ceiling(r: dict[str, object]) -> float:
-    """How much of the weekly window a candidate may already have spent.
-
-    Tighter while the week still has working days to run, because the budget has to stretch over
-    them; looser once the reset is close, when whatever is left would be wasted anyway.
-    """
-    left = workdays_left(ureset(r, "r7d"))
-    return PICK_7D_TIGHT if (left is not None and left > PICK_WORKDAYS) else PICK_7D
-
-
-def eligible(r: dict[str, object]) -> bool:
-    """Whether a credential is fit to be rotated INTO. Both windows have to pass on their own."""
     p5, p7 = upct(r, "u5h"), upct(r, "u7d")
-    if p5 is None or p5 >= PICK_5H:
+    if p5 is None or p7 is None or state_note(r).startswith(BLOCKED):
         return False
-    return p7 is not None and p7 < weekly_ceiling(r)
+    return p5 < LIMIT_5H and p7 < LIMIT_7D
+
+
+def over_limits(r: dict[str, object]) -> str:
+    """Which windows are past their limits, in words for a status line ("5h", "weekly", both)."""
+    p5, p7 = upct(r, "u5h"), upct(r, "u7d")
+    over = [w for w, p, lim in (("5h", p5, LIMIT_5H), ("weekly", p7, LIMIT_7D))
+            if p is not None and p >= lim]
+    return " and ".join(over) or state_note(r)
+
+
+def needs_rotate(r: dict[str, object], pinned: bool,
+                 now: float | None = None) -> tuple[bool, str]:
+    """Whether auto-rotate should move off the live credential, and a line saying why (or why not).
+
+    Unpinned: as soon as it is not usable. Pinned — injected by hand with `t` — the same, with one
+    allowance: over on the 5h window only, with that window resetting within PIN_GRACE, it is kept
+    until PIN_CEILING, because the quota is about to come back and the choice was a person's. A
+    spent credential, a weekly overrun, or a reset further off moves it like any other.
+    """
+    if usable(r):
+        return False, ""
+    why = over_limits(r)
+    if not pinned or not pin_holds(r):
+        return True, why
+    p5, p7 = upct(r, "u5h"), upct(r, "u7d")
+    if p7 is not None and p7 >= LIMIT_7D:
+        return True, f"{why} — pinned, but the weekly window is days from resetting"
+    reset = ureset(r, "r5h")
+    left = None if reset is None else reset - (time.time() if now is None else now)
+    if left is None or left > PIN_GRACE:
+        return True, f"{why} — pinned, but its 5h window does not reset within the hour"
+    if p5 is not None and p5 >= PIN_CEILING:
+        return True, f"{why} — pinned, and now at {PIN_CEILING:.0f}%"
+    return False, (f"pinned and its 5h window resets in {max(0.0, left) / 60:.0f}m — "
+                   f"held until {PIN_CEILING:.0f}%")
 
 
 def worst_window(r: dict[str, object]) -> float | None:
@@ -1295,16 +1369,15 @@ def worst_window(r: dict[str, object]) -> float | None:
 
 
 def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
-                exclude: str = "", ceiling: float | None = None, strict: bool = False
+                exclude: str = "", strict: bool = False
                 ) -> "tuple[dict[str, str], float] | None":
     """The credential furthest from any of its limits, skipping one token and anything refusing.
 
-    `strict` applies the per-window candidate limits, and `ceiling` drops anything already at or
-    past the rotation threshold — swapping into that buys nothing, since it trips the same trigger
-    on the next cycle. Automation passes both. A person asking for the best available passes
-    neither: refusing to answer because no credential is comfortable leaves them with nothing when
-    what they wanted was the least bad one. Ranking is always `worst_window`, so a row is only
-    ever as fresh as its busiest window.
+    `strict` admits only a USABLE credential — both windows under their limits — and automation
+    passes it, since swapping into anything else trips the same trigger on the next cycle. A person
+    asking for the best available does not: refusing to answer because no credential is
+    comfortable leaves them with nothing when what they wanted was the least bad one. Ranking is
+    always `worst_window`, so a row is only ever as fresh as its busiest window.
 
     The blocked filter matters more here than it does for a clipboard copy: a row whose state
     starts with EXTRA, unauthorized, forbidden or rate cannot serve a request at all, so promoting
@@ -1316,12 +1389,10 @@ def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
         if not tok or tok == exclude:
             continue
         r = results.get(tok, {})
-        if state_note(r).startswith(("EXTRA", "unauthorized", "forbidden", "rate")):
-            continue
-        if strict and not eligible(r):
+        if state_note(r).startswith(BLOCKED) or (strict and not usable(r)):
             continue
         p = worst_window(r)
-        if p is not None and (ceiling is None or p < ceiling):
+        if p is not None:
             cands.append((p, row))
     if not cands:
         return None
@@ -1714,8 +1785,7 @@ def title_text(store: "Store", rows: list[dict[str, str]], results: dict) -> str
     if name and p is not None:
         if not LIVE.get("active"):
             return f"claude quota · 5h {p:.0f}% · {name} (off)"
-        hot = p >= float(LIVE.get("rotate_at") or ROTATE_AT) or state_note(r).startswith(
-            ("EXTRA", "unauthorized", "forbidden", "rate"))
+        hot = not usable(r)
         return f"claude quota · 5h {p:.0f}%{' !' if hot else ''} · {name}"
     worst = max([q for q in (upct(results.get(store.token(x), {}), "u5h") for x in rows)
                  if q is not None] or [0.0])
@@ -2223,15 +2293,17 @@ def live_note(results: dict, color: bool) -> tuple[str, str, str] | None:
     d = (lambda t: paint(t, DIM, color))
     hi = (lambda t, c=BOLD: paint(t, c, color))
     where = os.path.basename(str(LIVE["path"]))
-    at = float(LIVE.get("rotate_at") or ROTATE_AT)
+    limits = f" at 5h ≥{LIMIT_5H:.0f}% or weekly ≥{LIMIT_7D:.0f}%"
     if not LIVE.get("writable"):
         auto = d("auto-swap is off here (--no-env-write)")
     elif LIVE.get("auto") == "on":
-        auto = hi("auto-swap on", GREEN) + d(f" above {at:.0f}%")
+        auto = hi("auto-swap on", GREEN) + d(limits)
     elif LIVE.get("auto") == "park":
-        auto = hi("auto-swap parked", YELLOW) + d(f" above {at:.0f}% — kept fresh, left off")
+        auto = hi("auto-swap parked", YELLOW) + d(limits + " — kept fresh, left off")
     else:
         auto = d("auto-swap off ") + hi("T", CYAN) + d(" cycles it")
+    # File mode: Claude Code reads the token from the credentials file, the shell carries nothing.
+    user = "Claude Code" if LIVE.get("mode") == "file" else "your shell"
 
     if LIVE.get("err"):
         return "!", RED, d(f"cannot read {where} — {LIVE['err']}")
@@ -2250,9 +2322,14 @@ def live_note(results: dict, color: bool) -> tuple[str, str, str] | None:
     used = d(" — ") + hi(f"{p5:.0f}%", hue(p5, color)) + d(" of its 5h window used") \
         if p5 is not None else ""
     if not LIVE.get("active"):
+        if LIVE.get("mode") == "file":
+            return "◆", DIM, d("Claude Code is on your /login; ") + hi(str(name)) \
+                + d(" is recorded — ") + hi("z", CYAN) + d(" switches to it")
         return "◆", DIM, d("your shell has ") + hi(str(name)) + d(" but it is switched off — ") \
             + hi("z", CYAN) + d(" turns it back on")
-    return "◆", CYAN, d("your shell is using ") + hi(str(name)) + used + d(" · ") + auto
+    held = str(LIVE.get("held") or "")
+    return "◆", CYAN, d(f"{user} is using ") + hi(str(name)) + used + d(" · ") + auto \
+        + (d(" · " + held) if held else "")
 
 
 def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, *, mode: str,
@@ -2508,6 +2585,7 @@ def validate_token(store: Store, token: str, skip: dict[str, str] | None = None)
 # --------------------------------------------------------------------------- main
 
 def main() -> int:
+    global LIMIT_5H, LIMIT_7D
     here = app_dir()
     ap = argparse.ArgumentParser(
         description="Live 5h/7d/overage quota dashboard and credential manager.")
@@ -2540,9 +2618,15 @@ def main() -> int:
     ap.add_argument("--env-file", metavar="PATH", default=ENV_FILE,
                     help=f"shell file holding the live {TOKEN_COL} "
                          f"(default {ENV_FILE.replace(os.path.expanduser('~'), '~')})")
-    ap.add_argument("--rotate-at", type=float, metavar="PCT", default=ROTATE_AT,
-                    help=f"5h utilization at which auto-rotate swaps in a fresher credential "
-                         f"(default {ROTATE_AT:.0f})")
+    ap.add_argument("--limit-5h", type=float, metavar="PCT", default=LIMIT_5H,
+                    help=f"a credential is usable while its 5h window is below this "
+                         f"(default {LIMIT_5H:.0f}, i.e. at most {LIMIT_5H - 1:.0f}%%)")
+    ap.add_argument("--limit-7d", type=float, metavar="PCT", default=LIMIT_7D,
+                    help=f"a credential is usable while its weekly window is below this "
+                         f"(default {LIMIT_7D:.0f})")
+    ap.add_argument("--export-env", action="store_true",
+                    help=f"also EXPORT {TOKEN_COL} from the shell file (the old way): sessions "
+                         f"that inherit it ignore the credentials file and need a restart per swap")
     ap.add_argument("--auto-rotate", action="store_true",
                     help="start with auto-rotate on (otherwise it resumes its last state)")
     ap.add_argument("--rotate-mode", choices=ROTATE_MODES,
@@ -2554,9 +2638,10 @@ def main() -> int:
                     help="Claude Code credentials file kept in step with the shell file "
                          f"(default {LOCAL_CREDS.replace(os.path.expanduser('~'), '~')})")
     ap.add_argument("--no-creds-write", action="store_true",
-                    help="leave the credentials file alone — only the shell file follows t/T/z")
+                    help="leave the credentials file alone — implies --export-env, since the "
+                         "shell file is then the only way to hand a token over")
     ap.add_argument("--no-notify", action="store_true",
-                    help="no desktop notification when the live credential crosses the threshold "
+                    help="no desktop notification when the live credential goes past its limits "
                          "while sessions on this machine are still using it")
     ap.add_argument("--no-title", action="store_true",
                     help="leave the terminal title alone")
@@ -2592,12 +2677,15 @@ def main() -> int:
     marks: dict[str, dict[str, tuple[float | None, float]]] = {}
     events: list[str] = []
     new_events: list[str] = []
-    rotate_at = max(1.0, min(100.0, args.rotate_at))
+    LIMIT_5H = max(1.0, min(101.0, args.limit_5h))
+    LIMIT_7D = max(1.0, min(101.0, args.limit_7d))
     env_path = os.path.expanduser(args.env_file)
     env_ok = not args.no_env_write
     creds_path = os.path.expanduser(args.creds_file)
     # macOS keeps the login in the Keychain, so a file there is not what Claude Code reads.
     creds_ok = env_ok and not args.no_creds_write and sys.platform != "darwin"
+    # File mode needs the credentials file; without it the shell file is the only way to hand over.
+    file_mode = creds_ok and not args.export_env
     _saved = load_state()
     if args.rotate_mode:
         auto_rotate = args.rotate_mode
@@ -2617,7 +2705,6 @@ def main() -> int:
     if pinned and _st0.get("pinned") != pinned:  # an older file held the raw token: drop it now
         _st0["pinned"] = pinned
         save_state(_st0)
-    pin_said = False
 
     def read_live() -> None:
         """Refresh the cached view of the shell file. Cheap, and never fatal."""
@@ -2625,25 +2712,34 @@ def main() -> int:
             st = env_state(env_path, store)
         except Exception:                        # noqa: BLE001 — a dashboard must keep drawing
             st = {"path": env_path, "err": "unreadable"}
+        if file_mode and not st.get("err"):
+            # The shell file is only the record here; what Claude Code uses is the credentials
+            # file, so that decides both which credential is live and whether it is on.
+            try:
+                blk = creds_read(creds_path).get("claudeAiOauth")
+            except (RuntimeError, OSError):
+                blk = None
+            if creds_injected(blk):
+                st["token"] = blk["accessToken"]
+                st["name"] = token_name(store, st["token"])
+                st["active"] = True
+            else:
+                st["active"] = False
         LIVE.clear()
         LIVE.update(st)
         LIVE["auto"] = auto_rotate
         LIVE["writable"] = env_ok
-        LIVE["rotate_at"] = rotate_at
+        LIVE["mode"] = "file" if file_mode else "env"
 
-    def sync_creds() -> str:
-        """Bring the credentials file in line with the shell file just written, as a flash suffix.
+    def go_live(token: str, on: bool | None) -> str:
+        """Hand `token` over (see apply_live), then refresh LIVE. Raises when the record fails."""
+        msg = apply_live(env_path, creds_path, store, token, on, file_mode, creds_ok)
+        read_live()
+        return msg
 
-        Called only after this tool writes the shell file — never on a refresh, which would undo a
-        /login made by hand. Runs off LIVE, so read_live() must come first.
-        """
-        if not creds_ok or LIVE.get("err") or int(LIVE.get("idx", -1)) < 0:
-            return ""
-        try:
-            return " · " + creds_sync(creds_path, str(LIVE.get("token") or ""),
-                                      bool(LIVE.get("active")))
-        except (RuntimeError, OSError) as exc:
-            return f" · {os.path.basename(creds_path)} not updated: {exc}"
+    def env_holders() -> int:
+        """Sessions still carrying the variable from before — the ones a swap cannot reach."""
+        return len({pid for r in store.rows for pid, _ in sessions_on(store.token(r))})
 
     def record(results: dict) -> None:
         """History for the trend columns, and the reason behind any drop in a window.
@@ -2709,7 +2805,7 @@ def main() -> int:
             return ""
         cur = results.get(tok, {})
         p = worst_window(cur)
-        if p is None or p < rotate_at:
+        if p is None or usable(cur):
             warned_tok = ""                    # back under the line: re-arm for the next crossing
             return ""
         if warned_tok == tok:
@@ -2718,8 +2814,7 @@ def main() -> int:
         if not busy:
             return ""
         warned_tok = tok
-        p5 = upct(cur, "u5h")
-        which = "5h" if (p5 is not None and p5 >= rotate_at) else "weekly"
+        which = over_limits(cur)
         plural = "s" if len(busy) > 1 else ""
         line = (f"{name} is at {p:.0f}% of its {which} window and {len(busy)} "
                 f"session{plural} here still hold{'' if plural else 's'} it")
@@ -2730,77 +2825,69 @@ def main() -> int:
         return "⚠ " + line + " — finish up, then t"
 
     def auto_swap(results: dict, rows: list[dict[str, str]]) -> str:
-        """Swap in a fresher credential when the live one is spent. Returns a status line or "".
+        """Swap in a usable credential when the live one is not. Returns a status line or "".
 
-        BOTH windows decide. A credential at 4% of its five hours and 96% of its week is fresh by
-        the only number this used to read, and refused on the next request; `worst_window` takes
-        whichever is closest to its limit, for the incumbent and for every candidate.
+        BOTH windows decide: the live credential stays while its 5h window is under LIMIT_5H and
+        its weekly window under LIMIT_7D, and a replacement has to be under both as well. A pinned
+        credential gets the allowance in needs_rotate(), shown in the footer while it applies.
 
-        A switched-off variable is still kept fresh, but stays switched off. Writing a value and
+        A switched-off credential is still kept fresh, but stays switched off. Writing a value and
         turning it on are separate decisions — the second one is the user's, made with `z`, and a
         timer does not get to reverse it. So the value is parked: when it is switched back on, the
         best credential is already in place instead of whatever was there hours ago.
 
-        Deliberately does NOT stop the Claude Code supervisor. A running supervisor keeps the
-        credential it started with, so the swap only reaches processes started afterwards — but
-        killing it unprompted would cut off whatever session the user is in the middle of, which
-        is precisely the moment quota is tight. The manual key offers that; automation does not
-        get to make that call.
+        Deliberately does NOT stop the Claude Code supervisor: killing it unprompted would cut off
+        whatever session the user is in the middle of. In file mode it does not need to — a
+        session that did not inherit the variable picks the new token up on its next request.
         """
-        nonlocal last_rotate, no_cand_said, auto_rotate, pin_said
+        nonlocal last_rotate, no_cand_said, auto_rotate, pinned
         if auto_rotate == "off" or not env_ok or LIVE.get("err") or LIVE.get("ambiguous"):
             return ""
         tok = str(LIVE.get("token") or "")
         if not tok or not LIVE.get("name"):
             return ""                      # nothing written, or a token this list cannot judge
         cur = results.get(tok, {})
-        now = worst_window(cur)
-        if now is None or now < rotate_at:
-            no_cand_said = False           # back under the line: allow the next warning to speak
+        is_pinned = bool(pinned) and pinned == pin_id(tok)
+        go, why = needs_rotate(cur, is_pinned)
+        if not go:
+            LIVE["held"] = why             # a held pin says so for as long as it holds
+            if not why:
+                no_cand_said = False       # back under the line: allow the next warning to speak
             return ""
-        p5, p7 = upct(cur, "u5h"), upct(cur, "u7d")
-        which = "5h" if (p5 is not None and p5 >= rotate_at) else "weekly"
-        if p5 is not None and p7 is not None and p5 >= rotate_at and p7 >= rotate_at:
-            which = "5h and weekly"
-        if pinned and pinned == pin_id(tok) and pin_holds(cur):
-            # Held because a person chose it. The pin lifts only when the credential can no longer
-            # serve a request at all; below that, protecting the choice is the whole point.
-            if not pin_said:
-                pin_said = True
-                return (f"auto-rotate: {LIVE.get('name')} at {now:.0f}% was injected by hand — "
-                        f"holding it · inject another with t to release")
-            return ""
-        pin_said = False
         if time.time() - last_rotate < ROTATE_GAP:
             return ""
-        # `ceiling` keeps out anything already past the line on either window: swapping into one
-        # trips the same trigger next cycle and the dashboard spends its life rewriting $HOME.
-        pick = rotate_pick(store, rows, results, exclude=tok, ceiling=rotate_at, strict=True)
+        pick = rotate_pick(store, rows, results, exclude=tok, strict=True)
         if pick is None:
             if not no_cand_said:
                 no_cand_said = True
-                return (f"auto-rotate: {LIVE.get('name')} at {now:.0f}% ({which}) but no "
-                        f"credential is under {rotate_at:.0f}% on both windows — staying put")
+                return (f"auto-rotate: {LIVE.get('name')} is past its limit ({why}) but no "
+                        f"credential is under 5h {LIMIT_5H:.0f}% and weekly {LIMIT_7D:.0f}% "
+                        f"— staying put")
             return ""
         row, p = pick
         old = LIVE.get("name")
         try:
-            # `park` writes it switched off on purpose; `on` keeps the file's own state, because
-            # refreshing a parked value is housekeeping and switching it on would overrule the
-            # person who parked it.
-            env_set(env_path, store, store.token(row),
-                    activate=False if auto_rotate == "park" else None)
+            # `park` writes it switched off on purpose; `on` keeps the current on/off state,
+            # because refreshing a parked value is housekeeping and switching it on would overrule
+            # the person who parked it.
+            msg = go_live(store.token(row), False if auto_rotate == "park" else None)
         except (RuntimeError, OSError) as exc:
             auto_rotate = "off"        # a failure that repeats every interval is noise, not news
             read_live()
             return f"auto-rotate OFF — write failed: {exc}"
         last_rotate, no_cand_said = time.time(), False
-        read_live()
-        synced = sync_creds()
-        return (f"↻ auto-rotate: {old} {now:.0f}% ({which}) → {store.name(row)} {p:.0f}% · "
-                + ("sessions started with the variable keep the old one until restarted"
-                   if LIVE.get("active") else "switched off — z activates it")
-                + synced)
+        if is_pinned:                  # the pin was on the credential just rotated away from
+            pinned = ""
+            _st = load_state()
+            _st.pop("pinned", None)
+            save_state(_st)
+        if not LIVE.get("active"):
+            tail = "switched off — z activates it"
+        elif file_mode:
+            tail = "open sessions switch on their next request"
+        else:
+            tail = "sessions started with the variable keep the old one until restarted"
+        return f"↻ auto-rotate: {old} ({why}) → {store.name(row)} {p:.0f}% · {tail} · {msg}"
 
     read_live()
 
@@ -2834,6 +2921,20 @@ def main() -> int:
         return 0 if all(r.get("ok") for r in results.values()) else 1
 
     flash, probes, inspect = "", 0, None
+    if file_mode:
+        # A token the shell still exports is handed to every session started from it, and those
+        # sessions then ignore the credentials file for good. Move it over, once, up front.
+        try:
+            moved = migrate_to_file(env_path, creds_path, store)
+        except (RuntimeError, OSError) as exc:
+            moved = f"could not move the token to {os.path.basename(creds_path)}: {exc}"
+        if moved:
+            read_live()
+            n = env_holders()
+            flash = moved + (f" · {n} open session{'s' if n > 1 else ''} still carry the old "
+                             f"variable — restart {'those' if n > 1 else 'it'} once (claude -r)"
+                             if n else "")
+            events.append(flash)
     diag: tuple[str, dict] | None = None
     results: dict = {}
     last, due = 0.0, 0.0
@@ -2984,31 +3085,37 @@ def main() -> int:
                             continue
                         row, p5 = pick
                     at5 = f"{p5:.0f}% of 5h" if p5 is not None else "5h unknown"
-                    ok = ask(keys, f"  write '{store.name(row)}' ({at5}) to {env_path}? [y/N]: ")
+                    dest = os.path.basename(creds_path) if file_mode else env_path
+                    ok = ask(keys, f"  switch to '{store.name(row)}' ({at5}) via {dest}? [y/N]: ")
                     if not ok.lower().startswith("y"):
                         flash = "inject cancelled"
                         continue
                     was_off = LIVE.get("idx", -1) >= 0 and not LIVE.get("active")
                     try:
-                        # Manual inject is the deliberate override: it ignores the threshold and
-                        # it switches the variable on, which auto-rotate is not allowed to do.
-                        msg = env_set(env_path, store, store.token(row), activate=True)
+                        # Manual inject is the deliberate override: it ignores the limits and it
+                        # switches the credential on, which auto-rotate is not allowed to do.
+                        msg = go_live(store.token(row), True)
                     except (RuntimeError, OSError) as exc:
                         flash = f"not written: {exc}"
                         continue
-                    read_live()
-                    msg += sync_creds()
-                    pinned = pin_id(store.token(row))  # a hand-made choice auto-rotate must keep
+                    pinned = pin_id(store.token(row))  # a hand-made choice auto-rotate respects
                     _st = load_state()
                     _st["pinned"] = pinned
                     save_state(_st)
                     flash = f"injected '{store.name(row)}' — {msg} · pinned"
                     if was_off:
                         flash += " · switched ON (it was off)"
-                    stop = ask(keys, "  a running supervisor keeps its old credential — "
-                                     "stop it now? [y/N]: ")
-                    flash += " · " + (daemon_stop() if stop.lower().startswith("y")
-                                      else "restart Claude Code clients to pick it up")
+                    held = env_holders()
+                    if file_mode and not held:
+                        flash += " · open sessions switch on their next request"
+                    elif file_mode:
+                        flash += (f" · {held} session{'s' if held > 1 else ''} still carry the old "
+                                  f"variable from before — restart once (claude -r)")
+                    else:
+                        stop = ask(keys, "  a running supervisor keeps its old credential — "
+                                         "stop it now? [y/N]: ")
+                        flash += " · " + (daemon_stop() if stop.lower().startswith("y")
+                                          else "restart Claude Code clients to pick it up")
                 elif key == "T":
                     auto_rotate = ROTATE_MODES[
                         (ROTATE_MODES.index(auto_rotate) + 1) % len(ROTATE_MODES)]
@@ -3022,21 +3129,24 @@ def main() -> int:
                     elif auto_rotate == "off":
                         flash = "auto-rotate OFF — the shell file is left alone entirely"
                     elif auto_rotate == "park":
-                        flash = (f"auto-rotate PARK — past {rotate_at:.0f}% the best credential is "
-                                 f"written switched off · z activates it")
+                        flash = (f"auto-rotate PARK — past 5h {LIMIT_5H:.0f}% or weekly "
+                                 f"{LIMIT_7D:.0f}% the best credential is recorded switched off "
+                                 f"· z activates it")
                     else:
-                        flash = f"auto-rotate ON — swaps when the live token passes {rotate_at:.0f}%"
+                        flash = (f"auto-rotate ON — swaps at 5h {LIMIT_5H:.0f}% or weekly "
+                                 f"{LIMIT_7D:.0f}%")
                 elif key == "z":
                     if not env_ok:
                         flash = "--no-env-write: the shell file is read-only"
                         continue
                     try:
-                        msg, _on = env_toggle(env_path)
+                        msg, _on = toggle_live(env_path, creds_path, store, file_mode, creds_ok)
                     except (RuntimeError, OSError) as exc:
                         flash = f"not changed: {exc}"
                         continue
                     read_live()
-                    flash = msg + sync_creds() + " · sessions started with the variable need a restart"
+                    flash = msg + (" · open sessions switch on their next request" if file_mode
+                                   else " · sessions started with the variable need a restart")
                 elif key == "a":
                     if store.readonly:
                         flash = "list is read-only (--from-env)"
@@ -3142,17 +3252,14 @@ def main() -> int:
                     # A shell still exporting the replaced value now points at a credential that
                     # is not in the list any more, which reads as "unknown token" everywhere.
                     if changed_tok and env_ok and LIVE.get("token") == old_tok:
-                        up = ask(keys, f"  {os.path.basename(env_path)} still exports the old "
-                                       f"value — update it? [Y/n]: ")
+                        up = ask(keys, "  the live credential still carries the old value — "
+                                       "update it? [Y/n]: ")
                         if not up.lower().startswith("n"):
                             try:
-                                flash += " · " + env_set(env_path, store, new_tok)
+                                flash += " · " + go_live(new_tok, None)   # on/off stays as it was
                             except (RuntimeError, OSError) as exc:
-                                flash += f" · shell file not updated: {exc}"
+                                flash += f" · not updated: {exc}"
                                 read_live()
-                            else:
-                                read_live()
-                                flash += sync_creds()
     except KeyboardInterrupt:
         pass
     finally:
