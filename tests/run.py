@@ -372,18 +372,22 @@ STATUSLINE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
                           "plugin", "statusline_command.md")
 
 
-def account_cell(cfg: str, csv: str, env_tok: str = "") -> str:
+def account_cell(cfg: str, csv: str | None, env_tok: str = "", script: str = STATUSLINE,
+                 path_dir: str = "") -> str:
     """The account cell (row 2, column 1) for a session configured by `cfg`.
 
     Run under a bash that has no token in its own environment, because the script falls back to
     its parent's /proc environ — and this suite's parent may well be a shell exporting a real one.
+    `csv=None` leaves STATUSLINE_TOKEN_CSV unset, so the script has to find the CSV itself.
     """
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": cfg,
-           "CLAUDE_CONFIG_DIR": cfg, "STATUSLINE_TOKEN_CSV": csv}
+    env = {"PATH": (path_dir + ":" if path_dir else "") + "/usr/local/bin:/usr/bin:/bin",
+           "HOME": cfg, "CLAUDE_CONFIG_DIR": cfg}
+    if csv is not None:
+        env["STATUSLINE_TOKEN_CSV"] = csv
     if env_tok:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = env_tok
     payload = json.dumps({"model": {"display_name": "Opus"}})
-    out = subprocess.run(["bash", "-c", f"{STATUSLINE!r}; true"], input=payload, env=env,
+    out = subprocess.run(["bash", "-c", f"{script!r}; true"], input=payload, env=env,
                          capture_output=True, text=True).stdout
     rows = [re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in out.splitlines()]
     return rows[1].split("│")[0].strip() if len(rows) > 1 else ""
@@ -414,6 +418,25 @@ def test_statusline_account(d: str) -> None:
 
     check("statusline: the session's own variable wins over the file",
           account_cell(cfg, csv, env_tok=tok("B")) == f"bob sk...{tok('B')[-8:]}")
+
+    # Installed as a copy away from the repo, the CSV is found beside the rotator on PATH.
+    m.creds_inject(creds, tok("A"))
+    # Two levels down: the copy looks at ../token.csv first, and store_with() leaves one in `d`.
+    repo, bindir, away = (os.path.join(d, x) for x in ("slrepo", "slbin", "slaway/sub"))
+    for x in (repo, bindir, away):
+        os.makedirs(x)
+    shutil.copy(csv, os.path.join(repo, "token.csv"))
+    rotator = os.path.join(repo, "claude-token-rotate")
+    with open(rotator, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\n")
+    os.chmod(rotator, 0o755)
+    os.symlink(rotator, os.path.join(bindir, "claude-token-rotate"))
+    copy = os.path.join(away, "statusline-command.sh")
+    shutil.copy(STATUSLINE, copy)
+    check("statusline: a copy away from the repo finds the CSV beside the rotator",
+          account_cell(cfg, None, script=copy, path_dir=bindir) == f"alice sk...{tok('A')[-8:]}")
+    check("statusline: no rotator on PATH keeps the Token label",
+          account_cell(cfg, None, script=copy) == f"Token sk...{tok('A')[-8:]}")
 
     os.unlink(creds)
     check("statusline: no credentials file falls back to the email",
