@@ -97,22 +97,31 @@ def test_parked_injection(d: str) -> None:
 
 
 def test_both_windows_decide(d: str) -> None:
-    """A candidate is only as fresh as its busiest window."""
-    store = store_with(d, live=tok("L"), weekly_spent=tok("W"), good=tok("G"))
-    check("worst_window takes the higher", m.worst_window(reading(4, 96)) == 96.0)
-    res = {tok("L"): reading(80, 10), tok("W"): reading(4, 96), tok("G"): reading(20, 20)}
-    pick = m.rotate_pick(store, store.rows, res, exclude=tok("L"), ceiling=75.0)
-    check("skips the 4%/96% trap", pick is not None and store.name(pick[0]) == "good")
-    check("ranks on the busiest window", pick is not None and pick[1] == 20.0)
+    """A credential is usable only while BOTH windows are under their limits."""
+    check("5h 60% is usable", m.usable(reading(60, 10)))
+    check("5h 61% is not", not m.usable(reading(61, 10)))
+    check("weekly 74% is usable", m.usable(reading(10, 74)))
+    check("weekly 75% is not", not m.usable(reading(10, 75)))
+    check("a missing window is never usable", not m.usable({"u5h": "0.10"}))
+    check("a spent credential is never usable",
+          not m.usable({**reading(10, 10), "err": "unauthorized"}))
+    # No weekend or working-day arithmetic: the weekly limit is the same whenever it resets.
+    soon = {**reading(10, 70), "r7d": str(time.time() + 3600)}
+    later = {**reading(10, 70), "r7d": str(time.time() + 6 * 86400)}
+    check("weekly limit ignores how far off the reset is", m.usable(soon) and m.usable(later))
 
-    spent = {tok("L"): reading(80, 10), tok("W"): reading(90, 10), tok("G"): reading(10, 88)}
-    check("no candidate when every row is past the line",
-          m.rotate_pick(store, store.rows, spent, exclude=tok("L"), ceiling=75.0) is None)
-    check("a forced pick still answers when nothing is comfortable",
+    store = store_with(d, live=tok("L"), weekly_spent=tok("W"), good=tok("G"), hot=tok("H"))
+    res = {tok("L"): reading(80, 10), tok("W"): reading(4, 96), tok("G"): reading(20, 20),
+           tok("H"): reading(61, 5)}
+    pick = m.rotate_pick(store, store.rows, res, exclude=tok("L"), strict=True)
+    check("skips the 4%/96% trap and the 61% 5h", pick is not None and store.name(pick[0]) == "good")
+    check("ranks on the busiest window", pick is not None and pick[1] == 20.0)
+    spent = {tok("L"): reading(80, 10), tok("W"): reading(90, 10), tok("G"): reading(10, 88),
+             tok("H"): reading(70, 70)}
+    check("a strict pick refuses when nothing is usable",
+          m.rotate_pick(store, store.rows, spent, exclude=tok("L"), strict=True) is None)
+    check("a forced pick still answers when nothing is usable",
           m.rotate_pick(store, store.rows, spent, exclude=tok("L")) is not None)
-    check("a strict pick refuses instead of settling",
-          m.rotate_pick(store, store.rows, spent, exclude=tok("L"),
-                        ceiling=75.0, strict=True) is None)
 
 
 def test_file_handling(d: str) -> None:
@@ -202,55 +211,37 @@ def test_session_detection(d: str) -> None:
     check("empty for an empty token", m.sessions_on("") == [])
 
 
-def test_pick_rules(d: str) -> None:
-    """Candidate limits, and the weekend-aware weekly budget.
+def test_rotation_rules(d: str) -> None:
+    """When auto-rotate moves off the live credential — pinned or not.
 
-    Timestamps are fixed rather than taken from the clock: a rule about which weekday it is would
-    otherwise pass or fail depending on when the suite runs.
+    A pin is a person's choice, so it gets slack an unpinned credential does not: when its 5h
+    window resets within the hour it is kept until 95%, because the quota is about to come back.
+    Further out than that, or over on the weekly window, it is rotated like any other.
     """
-    import datetime as dt
+    now = 1_800_000_000.0
 
-    def span(start: str, end: str) -> float | None:
-        fmt = "%Y-%m-%d %H:%M"
-        a = dt.datetime.strptime(start, fmt).timestamp()
-        b = dt.datetime.strptime(end, fmt).timestamp()
-        return m.workdays_left(b, now=a)
+    def live(p5: float, p7: float, reset_in: float) -> dict[str, object]:
+        return {**reading(p5, p7), "r5h": str(now + reset_in)}
 
-    # 2026-09-28 is a Monday.
-    check("Mon->Thu is 3 working days", abs(span("2026-09-28 00:00", "2026-10-01 00:00") - 3) < .01)
-    check("Fri->Tue drops Sat and Sun",
-          abs(span("2026-10-02 00:00", "2026-10-06 00:00") - 2) < .01)
-    check("Sat->Sun is not working time at all",
-          span("2026-10-03 00:00", "2026-10-04 12:00") <= 0)
-    check("a window already past reads zero", m.workdays_left(1.0, now=2.0) == 0.0)
-    check("no reset, no answer", m.workdays_left(None) is None)
-
-    now = dt.datetime.strptime("2026-09-28 00:00", "%Y-%m-%d %H:%M").timestamp()
-
-    def row(p5: float, p7: float, reset: str) -> dict[str, object]:
-        return {"u5h": f"{p5 / 100:.2f}", "u7d": f"{p7 / 100:.2f}",
-                "r7d": str(dt.datetime.strptime(reset, "%Y-%m-%d %H:%M").timestamp()),
-                "s5h": "allowed", "s7d": "allowed", "ok": True, "code": 200}
-
-    # Mon -> Fri is 4 working days: more than three, so the tighter budget applies.
-    loose, tight = row(10, 70, "2026-10-01 00:00"), row(10, 70, "2026-10-02 12:00")
-    check("<=3 working days left: the 80% budget", m.weekly_ceiling(loose) == m.PICK_7D)
-    check(">3 working days left: the 60% budget", m.weekly_ceiling(tight) == m.PICK_7D_TIGHT)
-    check("70% weekly passes the loose budget", m.eligible(loose))
-    check("70% weekly fails the tight budget", not m.eligible(tight))
-
-    check("5h at the limit is out", not m.eligible(row(50, 10, "2026-10-01 00:00")))
-    check("5h under the limit is in", m.eligible(row(49, 10, "2026-10-01 00:00")))
-    check("a missing window is never eligible", not m.eligible({"u5h": "0.10"}))
-
-    store = store_with(d, live=tok("L"), weekly_heavy=tok("W"), ok=tok("G"))
-    res = {tok("L"): row(80, 10, "2026-10-01 00:00"),
-           tok("W"): row(4, 96, "2026-10-01 00:00"),     # idle hour, spent week
-           tok("G"): row(20, 20, "2026-10-01 00:00")}
-    pick = m.rotate_pick(store, store.rows, res, exclude=tok("L"), ceiling=75.0)
-    check("the spent week is refused, the sound one chosen",
-          pick is not None and store.name(pick[0]) == "ok")
-    _ = now
+    rot = (lambda r, pinned: m.needs_rotate(r, pinned, now=now)[0])
+    check("unpinned: under both limits stays", not rot(live(60, 74, 7200), False))
+    check("unpinned: 5h 61% rotates", rot(live(61, 10, 7200), False))
+    check("unpinned: weekly 75% rotates", rot(live(10, 75, 7200), False))
+    check("unpinned: a near 5h reset changes nothing", rot(live(61, 10, 600), False))
+    check("pinned: under both limits stays", not rot(live(50, 10, 7200), True))
+    check("pinned: 5h over, reset more than 1h away -> rotated", rot(live(70, 10, 7200), True))
+    check("pinned: 5h over, reset in 45 min -> held", not rot(live(70, 10, 2700), True))
+    check("pinned: 5h over, reset in exactly 1h -> held", not rot(live(70, 10, 3600), True))
+    check("pinned: 5h over, reset in 20 min -> held", not rot(live(94, 10, 1200), True))
+    check("pinned: held only until 95%", rot(live(95, 10, 1200), True))
+    check("pinned: weekly over -> rotated even near a 5h reset", rot(live(10, 80, 1200), True))
+    check("pinned: weekly spent -> rotated",
+          rot({**live(10, 100, 7200), "s7d": "rejected", "ok": False, "code": 429}, True))
+    check("pinned: spent -> rotated",
+          rot({**live(100, 10, 1200), "s5h": "rejected", "ok": False, "code": 429}, True))
+    check("pinned: an unknown reset counts as far off", rot(reading(70, 10), True))
+    why = m.needs_rotate(live(70, 10, 2700), True, now=now)[1]
+    check("a held pin says why", "95" in why)
 
 
 def test_park_mode(d: str) -> None:
@@ -389,6 +380,55 @@ def test_creds_follow(d: str) -> None:
     check("sync off: back to the login", creds_block(synced)["claudeAiOauth"] == LOGIN)
 
 
+def test_file_mode(d: str) -> None:
+    """File mode: the shell carries no token at all, and the credentials file carries the live one.
+
+    That is what makes a swap reach sessions already open: a session that inherited the variable
+    ignores the file for the rest of its life, so the variable must never be handed out.
+    """
+    store = store_with(d, a=tok("A"), b=tok("B"))
+    rc = os.path.join(d, "fm_rc")
+    with open(rc, "w", encoding="utf-8") as fh:
+        fh.write(f'# doc\nexport {m.TOKEN_COL}="{tok("A")}"\n')
+    creds = creds_with(d, "fm_creds.json", LOGIN)
+    cblock = (lambda: creds_block(creds)["claudeAiOauth"])
+
+    m.migrate_to_file(rc, creds, store)
+    st = m.env_state(rc, store)
+    check("migrate: the shell no longer gets the token", shell_sees(rc) == "EMPTY")
+    check("migrate: the token is still recorded", st["token"] == tok("A") and not st["active"])
+    check("migrate: the credentials file carries it", cblock()["accessToken"] == tok("A"))
+    check("migrate: nothing to do the second time", m.migrate_to_file(rc, creds, store) == "")
+
+    m.apply_live(rc, creds, store, tok("B"), on=True, file_mode=True)
+    check("inject: the credentials file switches", cblock()["accessToken"] == tok("B"))
+    check("inject: the shell stays clean", shell_sees(rc) == "EMPTY")
+    check("inject: recorded for z", m.env_state(rc, store)["token"] == tok("B"))
+
+    msg, on = m.toggle_live(rc, creds, store, file_mode=True)
+    check("z off: back on the /login", not on and cblock() == LOGIN)
+    check("z off: the shell stays clean", shell_sees(rc) == "EMPTY")
+    m.apply_live(rc, creds, store, tok("A"), on=None, file_mode=True)
+    check("auto while off: the record is refreshed", m.env_state(rc, store)["token"] == tok("A"))
+    check("auto while off: the /login stays", cblock() == LOGIN)
+    msg, on = m.toggle_live(rc, creds, store, file_mode=True)
+    check("z on: the recorded token goes live", on and cblock()["accessToken"] == tok("A"))
+    m.apply_live(rc, creds, store, tok("B"), on=None, file_mode=True)
+    check("auto while on: the live token follows", cblock()["accessToken"] == tok("B"))
+    m.apply_live(rc, creds, store, tok("A"), on=False, file_mode=True)
+    check("park: back on the /login, pick recorded",
+          cblock() == LOGIN and m.env_state(rc, store)["token"] == tok("A"))
+    check("creds_on reads the switch", not m.creds_on(creds))
+
+    rc2 = os.path.join(d, "fm_rc2")
+    with open(rc2, "w", encoding="utf-8") as fh:
+        fh.write(f'export {m.TOKEN_COL}="{tok("A")}"\n')
+    creds2 = creds_with(d, "fm_creds2.json", LOGIN)
+    m.apply_live(rc2, creds2, store, tok("B"), on=True, file_mode=False)
+    check("env mode: the shell gets the token", shell_sees(rc2) == tok("B"))
+    check("env mode: the credentials file follows", creds_block(creds2)["claudeAiOauth"]["accessToken"] == tok("B"))
+
+
 STATUSLINE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "plugin", "statusline_command.md")
 
@@ -469,8 +509,9 @@ def main() -> int:
     try:
         for fn in (test_disable_beats_inheritance, test_parked_injection,
                    test_both_windows_decide, test_file_handling, test_refusals,
-                   test_session_detection, test_pick_rules, test_park_mode,
-                   test_creds_follow, test_statusline_account, test_pin_lifts_when_spent):
+                   test_session_detection, test_rotation_rules, test_park_mode,
+                   test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
+                   test_file_mode):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)
