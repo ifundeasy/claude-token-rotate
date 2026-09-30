@@ -135,8 +135,13 @@ as a sound replacement, and a margin on top would reject candidates that are pla
 
 **A hand-injected credential is pinned.** `t` records your choice, and auto-rotate will not swap
 it away — not at 80%, not at 95%. The pin lifts only when that credential can no longer serve a
-request at all (`EXTRA spent`, rejected, unauthorized), because at that point protecting the choice
-protects nothing. Injecting another credential moves the pin; the pin survives a restart.
+request at all — a spent window (`5h rejected`, `7d rejected`), `EXTRA spent`, unauthorized —
+because at that point protecting the choice protects nothing, and auto-rotate moves on at its
+next check. Injecting another credential moves the pin; the pin survives a restart, recorded in
+`data.json` as a digest, never as the token.
+
+A spent window is easy to miss: its 429 still carries the quota headers, so the only sign is the
+status. The pin used to overlook that and hold a spent credential indefinitely.
 
 `t` is also the forced pick in the other sense: choosing "the freshest" from its prompt ignores the
 candidate limits entirely, so it still answers when no credential is comfortable. Refusing to name
