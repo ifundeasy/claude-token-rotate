@@ -56,7 +56,8 @@ back to your /login and forward again, and `T` cycles what auto-rotate is allowe
     usable      5h < LIMIT_5H (61, so at most 60%)  and  weekly < LIMIT_7D (75)
     trigger     the live credential is not usable
                 and at least ROTATE_GAP seconds since the last swap
-    choose      the usable credential with the lowest max(5h, weekly)
+    choose      among the usable ones, the soonest weekly reset — then, between weekly
+                resets under RESET_TIE (1h) apart, the soonest 5h reset
 
 Each window is judged on its own because they say different things. A credential at 4% of its five
 hours and 96% of its week is fresh by the first number and refused on the next request. The weekly
@@ -189,6 +190,8 @@ ROTATE_GAP = 300.0                      # seconds between automatic swaps, so no
 #: is about to come back, so it is kept past the limit — until its 5h reaches PIN_CEILING.
 PIN_GRACE = 3600.0
 PIN_CEILING = 95.0
+#: Weekly resets closer together than this count as a tie when picking, so the 5h reset decides.
+RESET_TIE = 3600.0
 #: What auto-rotate is allowed to do, cycled with `T`.
 #:   off   write nothing at all
 #:   park  keep the value fresh but never switch it on, so the shell file is a standing
@@ -1374,10 +1377,15 @@ def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
     """The credential furthest from any of its limits, skipping one token and anything refusing.
 
     `strict` admits only a USABLE credential — both windows under their limits — and automation
-    passes it, since swapping into anything else trips the same trigger on the next cycle. A person
-    asking for the best available does not: refusing to answer because no credential is
-    comfortable leaves them with nothing when what they wanted was the least bad one. Ranking is
-    always `worst_window`, so a row is only ever as fresh as its busiest window.
+    passes it, since swapping into anything else trips the same trigger on the next cycle. Among
+    those, the quota that resets SOONEST is spent first, because whatever is left of it at the
+    reset is lost: the nearest weekly reset wins, and between weekly resets less than
+    RESET_TIE apart the nearest 5h reset decides. Ranking on headroom alone tied two credentials
+    at the same busiest window and let CSV order pick the one with days of week left.
+
+    A person asking for the best available passes no `strict`: refusing to answer because no
+    credential is usable leaves them with nothing when what they wanted was the least bad one, so
+    that pick ranks on `worst_window` — a row is only ever as fresh as its busiest window.
 
     The blocked filter matters more here than it does for a clipboard copy: a row whose state
     starts with EXTRA, unauthorized, forbidden or rate cannot serve a request at all, so promoting
@@ -1396,6 +1404,15 @@ def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
             cands.append((p, row))
     if not cands:
         return None
+    if strict:
+        inf = float("inf")
+        reset = (lambda row, f: ureset(results.get(store.token(row), {}), f) or inf)
+        first = min(reset(row, "r7d") for _, row in cands)
+        # `== first` too: with no weekly reset known anywhere, inf - inf is NaN and matches nothing.
+        near = [(p, row) for p, row in cands
+                if reset(row, "r7d") == first or reset(row, "r7d") - first < RESET_TIE]
+        best, row = min(near, key=lambda t: (reset(t[1], "r5h"), t[0]))
+        return row, best
     best, row = min(cands, key=lambda t: t[0])
     return row, best
 
