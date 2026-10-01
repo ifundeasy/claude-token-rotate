@@ -116,7 +116,8 @@ carried the variable). This is **file mode**, the default.
 
 ```
 usable      5h < 61%  (at most 60%)   and   weekly < 75%
-trigger     the live credential is not usable, and 300s have passed since the last swap
+trigger     the live credential is not usable, and 15s have passed since the last swap
+            (checked after every refresh — `--interval`, default 60s)
 choose      among the usable ones, the soonest weekly reset;
             weekly resets under 1h apart: the soonest 5h reset
 ```
