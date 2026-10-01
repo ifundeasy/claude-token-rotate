@@ -211,6 +211,46 @@ def test_session_detection(d: str) -> None:
     check("empty for an empty token", m.sessions_on("") == [])
 
 
+def test_pick_soonest_reset(d: str) -> None:
+    """Among usable credentials, spend first the quota that resets soonest — it is lost otherwise.
+
+    Weekly decides, because the weekly quota is the scarce one; the 5h reset breaks a tie between
+    weekly resets less than an hour apart. Numbers from a real dashboard where Farhan won on CSV
+    order alone — tied with Bernard on max(5h, weekly) = 60 — while Bernard's week ended in 10h.
+    """
+    now = time.time()
+    H = 3600
+
+    def row(p5: float, p7: float, r5: float | None, r7: float | None) -> dict[str, object]:
+        r = reading(p5, p7)
+        if r5 is not None:
+            r["r5h"] = str(now + r5)
+        if r7 is not None:
+            r["r7d"] = str(now + r7)
+        return r
+
+    store = store_with(d, trias=tok("T"), farhan=tok("F"), nico=tok("N"), bernard=tok("B"))
+    res = {tok("T"): row(61, 35, 0.4 * H, 132 * H), tok("F"): row(30, 60, 3.55 * H, 89 * H),
+           tok("N"): row(10, 73, 1.7 * H, 42 * H), tok("B"): row(2, 60, 3.2 * H, 10 * H)}
+    pick = m.rotate_pick(store, store.rows, res, exclude=tok("T"), strict=True)
+    check("soonest weekly reset wins: bernard, not farhan by CSV order",
+          pick is not None and store.name(pick[0]) == "bernard")
+    check("weekly beats a nearer 5h reset (nico)", pick is not None and store.name(pick[0]) != "nico")
+
+    s2 = store_with(d, x=tok("X"), y=tok("Y"))
+    near = {tok("X"): row(10, 10, 3 * H, 10 * H), tok("Y"): row(10, 10, 1 * H, 10.5 * H)}
+    check("weekly resets under 1h apart: the nearer 5h reset decides",
+          store.name(m.rotate_pick(s2, s2.rows, near, strict=True)[0]) == "y")
+    far = {tok("X"): row(10, 10, 3 * H, 10 * H), tok("Y"): row(10, 10, 0.2 * H, 11.1 * H)}
+    check("weekly resets over 1h apart: weekly still decides",
+          store.name(m.rotate_pick(s2, s2.rows, far, strict=True)[0]) == "x")
+    blind = {tok("X"): row(10, 10, None, None), tok("Y"): row(40, 40, 3 * H, 50 * H)}
+    check("an unknown reset ranks last",
+          store.name(m.rotate_pick(s2, s2.rows, blind, strict=True)[0]) == "y")
+    check("a forced pick still takes the most headroom",
+          store.name(m.rotate_pick(s2, s2.rows, blind)[0]) == "x")
+
+
 def test_rotation_rules(d: str) -> None:
     """When auto-rotate moves off the live credential — pinned or not.
 
@@ -509,7 +549,8 @@ def main() -> int:
     try:
         for fn in (test_disable_beats_inheritance, test_parked_injection,
                    test_both_windows_decide, test_file_handling, test_refusals,
-                   test_session_detection, test_rotation_rules, test_park_mode,
+                   test_session_detection, test_rotation_rules, test_pick_soonest_reset,
+                   test_park_mode,
                    test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
                    test_file_mode):
             fn(d)

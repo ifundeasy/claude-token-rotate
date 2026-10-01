@@ -117,13 +117,21 @@ carried the variable). This is **file mode**, the default.
 ```
 usable      5h < 61%  (at most 60%)   and   weekly < 75%
 trigger     the live credential is not usable, and 300s have passed since the last swap
-choose      the usable credential with the lowest max(5h, weekly)
+choose      among the usable ones, the soonest weekly reset;
+            weekly resets under 1h apart: the soonest 5h reset
 ```
 
 **Both windows decide.** A credential at 4% of its five hours and 96% of its week is fresh by the
 five-hour number alone and refused on the next request, so each window is checked on its own. The
 weekly limit is flat — no weekend or working-day arithmetic. `--limit-5h` and `--limit-7d` move
 them.
+
+**Spend first what resets first.** Whatever is left of a quota at its reset is lost, so among the
+usable credentials the one whose weekly window resets soonest is picked — the weekly quota is the
+scarce one. When two weekly resets are less than an hour apart, the sooner 5h reset decides.
+Ranking on headroom alone used to tie credentials at the same busiest window and let CSV order pick
+one with days of week left over another whose week ended in hours. `t`'s "freshest" pick still
+ranks on headroom, since its job is the least bad option when nothing is usable.
 
 There is no "beat the incumbent by N points" rule. The limits already say what counts as a sound
 replacement, and a margin on top would reject candidates that are plainly fine. When nothing is
