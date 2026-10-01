@@ -273,6 +273,11 @@ class Store:
     def __init__(self, path: str | None, rows: list[dict[str, str]],
                  fields: list[str], readonly: bool = False) -> None:
         self.path, self.rows, self.fields, self.readonly = path, rows, fields, readonly
+        # The whole credential list. `rows` is the VIEW — the same list until --only narrows it —
+        # and every add and remove goes through this class so the two can never disagree. The
+        # live credential is named from here, and a token missing from it is one auto-rotate
+        # refuses to judge, so a stale copy is exactly how a rotation goes silent.
+        self.all_rows = rows
 
     # -- reading ------------------------------------------------------------
     @staticmethod
@@ -361,7 +366,7 @@ class Store:
             with os.fdopen(fd, "w", newline="", encoding="utf-8") as fh:
                 wr = csv.DictWriter(fh, fieldnames=self.fields, extrasaction="ignore")
                 wr.writeheader()
-                for r in self.rows:
+                for r in self.all_rows:           # not the view: --only must not drop rows
                     wr.writerow(r)
             os.replace(tmp, self.path)
             os.chmod(self.path, 0o600)           # the file holds live credentials
@@ -375,9 +380,22 @@ class Store:
         row = {f: "" for f in self.fields}
         row[self.name_col], row[self.tok_col] = name, token
         self.rows.append(row)
+        if self.all_rows is not self.rows:
+            self.all_rows.append(row)
+
+    def remove(self, row: dict[str, str]) -> None:
+        self.rows.remove(row)
+        if self.all_rows is not self.rows and row in self.all_rows:
+            self.all_rows.remove(row)
 
     def delete(self, idx: int) -> dict[str, str]:
-        return self.rows.pop(idx)
+        row = self.rows[idx]
+        self.remove(row)
+        return row
+
+    def only(self, names: set[str]) -> None:
+        """Narrow the view to these names (lower-case). The full list stays intact."""
+        self.rows = [r for r in self.all_rows if self.name(r).lower() in names]
 
     def rename(self, idx: int, name: str) -> None:
         self.rows[idx][self.name_col] = name
@@ -2667,10 +2685,9 @@ def main() -> int:
 
     store = Store.from_env(args.from_env or None) if args.from_env is not None \
         else Store.from_csv(args.csv)
-    store.all_rows = list(store.rows)        # --only filters the view; naming the live token
-    if args.only:                            # must still see every credential in the file
+    if args.only:                            # narrows the view; the full list stays in store
         want = {w.strip().lower() for w in args.only.split(",") if w.strip()}
-        store.rows = [r for r in store.rows if store.name(r).lower() in want]
+        store.only(want)
         if not store.rows:
             raise SystemExit(f"--only {args.only}: no matching credential")
 
@@ -3205,7 +3222,7 @@ def main() -> int:
                     ok = ask(keys, f"  delete '{store.name(row)}' ({redact(store.token(row))})"
                                    f"{live_now}? [y/N]: ")
                     if ok.lower().startswith("y"):
-                        store.rows.remove(row)
+                        store.remove(row)
                         results.pop(store.token(row), None)
                         hist.pop(store.token(row), None)
                         if inspect == store.token(row):

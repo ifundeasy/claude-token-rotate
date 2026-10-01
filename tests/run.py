@@ -211,6 +211,43 @@ def test_session_detection(d: str) -> None:
     check("empty for an empty token", m.sessions_on("") == [])
 
 
+def test_rows_added_while_running(d: str) -> None:
+    """A credential added while the dashboard runs must be as known as one loaded at startup.
+
+    The live credential is NAMED from the full list, and auto-rotate refuses to judge a token it
+    cannot name. That list used to be a copy taken at startup, so a credential added with `a`
+    never entered it: once auto-rotate picked it, the live token had no name and auto-rotate went
+    silent — and the credential was ridden past 100% of its 5h window.
+    """
+    store = store_with(d, a=tok("A"), b=tok("B"), c=tok("C"))
+    store.add("new", tok("N"))
+    check("added while running: the live token is named", m.token_name(store, tok("N")) == "new")
+    rc = os.path.join(d, "rows_rc")
+    with open(rc, "w", encoding="utf-8") as fh:
+        fh.write(f'export {m.TOKEN_COL}="{tok("N")}"\n')
+    check("added while running: the shell file's token is named too",
+          m.env_state(rc, store)["name"] == "new")
+
+    # --only narrows the VIEW. Adding, removing and saving still work on the whole file.
+    store.only({"a"})
+    check("--only: the view is narrowed", [store.name(r) for r in store.rows] == ["a"])
+    store.add("late", tok("L"))
+    check("--only: a credential added in the view is named", m.token_name(store, tok("L")) == "late")
+    check("--only: a hidden credential is still named", m.token_name(store, tok("B")) == "b")
+    store.remove(store.rows[0])
+    store.save()
+    saved = [r["Name"] for r in csv_rows(store.path)]
+    check("--only: saving keeps the credentials the view hides",
+          saved == ["b", "c", "new", "late"])
+    check("removed: no longer named", m.token_name(store, tok("A")) is None)
+
+
+def csv_rows(path: str) -> list[dict[str, str]]:
+    import csv as _csv
+    with open(path, encoding="utf-8", newline="") as fh:
+        return list(_csv.DictReader(fh))
+
+
 def test_pick_soonest_reset(d: str) -> None:
     """Among usable credentials, spend first the quota that resets soonest — it is lost otherwise.
 
@@ -550,6 +587,7 @@ def main() -> int:
         for fn in (test_disable_beats_inheritance, test_parked_injection,
                    test_both_windows_decide, test_file_handling, test_refusals,
                    test_session_detection, test_rotation_rules, test_pick_soonest_reset,
+                   test_rows_added_while_running,
                    test_park_mode,
                    test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
                    test_file_mode):
