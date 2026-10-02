@@ -192,6 +192,8 @@ PIN_GRACE = 3600.0
 PIN_CEILING = 95.0
 #: Weekly resets closer together than this count as a tie when picking, so the 5h reset decides.
 RESET_TIE = 3600.0
+#: How long a digit key waits for a second digit when a two-digit row number could follow.
+DIGIT_WAIT = 0.6
 #: What auto-rotate is allowed to do, cycled with `T`.
 #:   off   write nothing at all
 #:   park  keep the value fresh but never switch it on, so the shell file is a standing
@@ -3088,9 +3090,17 @@ def main() -> int:
                             flash = "copy cancelled"
                             continue
                     else:
-                        i = int(key) - 1
+                        num = key
+                        # Rows past nine are typed as two digits. When this digit can start one
+                        # (a "1" with 13 rows), give the second digit a moment to arrive; a lone
+                        # digit still copies its own row once the moment passes.
+                        if int(key) * 10 <= len(rows):
+                            nxt = keys.get(DIGIT_WAIT)
+                            if nxt and nxt.isdigit() and int(key + nxt) <= len(rows):
+                                num = key + nxt
+                        i = int(num) - 1
                         if i >= len(rows):
-                            flash = f"no row {key} — press c to type a row number"
+                            flash = f"no row {num} — press c to type a row number"
                             continue
                     via = copy_to_clipboard(store.token(rows[i]))
                     flash = (f"copied token for '{store.name(rows[i])}' via {via} "
