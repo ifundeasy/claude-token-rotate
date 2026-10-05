@@ -581,6 +581,82 @@ def test_statusline_account(d: str) -> None:
           account_cell(cfg, csv) == "me@example.com")
 
 
+def test_header_sort(d: str) -> None:
+    """Clicking a header sorts by it and a second click reverses; keys arrive whole.
+
+    The reader used to take one byte at a time, so an arrow key or a mouse report came through as
+    separate characters: the left arrow (ESC [ D) ran diagnose, and a click typed its coordinates
+    as row numbers to copy.
+    """
+    now = time.time()
+    H = 3600
+
+    def row(p5: float, p7: float, r5: float | None, r7: float | None) -> dict[str, object]:
+        r = reading(p5, p7)
+        if r5 is not None:
+            r["r5h"] = str(now + r5)
+        if r7 is not None:
+            r["r7d"] = str(now + r7)
+        return r
+
+    store = store_with(d, alice=tok("A"), bob=tok("B"), carol=tok("C"), dave=tok("D"))
+    res = {tok("A"): row(10, 60, 2 * H, 72 * H), tok("B"): row(40, 20, 0.5 * H, 24 * H),
+           tok("C"): row(5, 5, 3 * H, 144 * H)}            # dave has no reading at all
+    names = (lambda how, desc=None: [store.name(r) for r in
+                                     m.sort_rows(store, store.rows, res, how, desc)])
+    check("sort 7d: busiest week first by default", names("7d") == ["alice", "bob", "carol", "dave"])
+    check("sort 7d reversed: idlest first, unread still last",
+          names("7d", False) == ["carol", "bob", "alice", "dave"])
+    check("sort r5h: soonest 5h reset first", names("r5h") == ["bob", "alice", "carol", "dave"])
+    check("sort r7d: soonest weekly reset first", names("r7d") == ["bob", "alice", "carol", "dave"])
+    check("sort r7d reversed: latest reset first, unknown still last",
+          names("r7d", True) == ["carol", "alice", "bob", "dave"])
+    check("sort name reversed: Z to A", names("name", True) == ["dave", "carol", "bob", "alice"])
+    check("sort csv reversed: bottom row first", names("csv", True)[0] == "dave")
+
+    check("split_key: plain key", m.split_key("ab") == ("a", "b"))
+    check("split_key: arrow is one key", m.split_key("\x1b[Dq") == ("\x1b[D", "q"))
+    check("split_key: mouse report is one key",
+          m.split_key("\x1b[<0;12;5M1") == ("\x1b[<0;12;5M", "1"))
+    check("split_key: half a sequence waits", m.split_key("\x1b[<0;1") is None)
+    check("split_key: lone ESC waits", m.split_key("\x1b") is None)
+    check("split_key: SS3 key", m.split_key("\x1bOPx") == ("\x1bOP", "x"))
+    check("mouse_click: left press", m.mouse_click("\x1b[<0;12;5M") == (12, 5))
+    check("mouse_click: release is not a click", m.mouse_click("\x1b[<0;12;5m") is None)
+    check("mouse_click: wheel is not a click", m.mouse_click("\x1b[<64;12;5M") is None)
+    check("mouse_click: an arrow is not a click", m.mouse_click("\x1b[D") is None)
+
+    hits: dict = {}
+    rows = m.sort_rows(store, store.rows, res, "7d")
+    frame = m.render(store, rows, res, {}, mode="b", sort="7d", interval=60, last=now, probes=4,
+                     flash="", color=False, cols=160, live=True, alert=None, inspect=None,
+                     hits=hits)
+    lines = frame.split("\n")
+    head = lines[hits["line"]]
+    hits["row"] = m.header_row(hits["line"], frame, 200)
+    at = {}
+    for x0, x1, order in hits["spans"]:
+        at.setdefault(head[x0 - 1:x1].strip(), order)
+    check("header click map: each label sorts by its own column",
+          at.get("NAME") == "name" and at.get("5H") == "5h" and at.get("7D▼") == "7d"
+          and at.get("#") == "csv" and at.get("EXTRA") == "ov")
+    resets = [o for x0, x1, o in hits["spans"] if head[x0 - 1:x1].strip() == "RESET"]
+    check("header click map: the two RESET columns sort by their own window",
+          resets == ["r5h", "r7d"])
+    check("header marks the active order", "7D▼" in head and "▲" not in head)
+    x_name = head.index("NAME") + 1
+    check("a click on NAME in the header row sorts by name",
+          m.header_order(hits, (x_name, hits["row"])) == "name")
+    check("a click one row below the header does nothing",
+          m.header_order(hits, (x_name, hits["row"] + 1)) is None)
+    check("a click on TOKEN does nothing",
+          m.header_order(hits, (head.index("TOKEN") + 1, hits["row"])) is None)
+    n = frame.count("\n") + 1
+    check("header row: a frame that fits stays put", m.header_row(4, frame, n + 1) == 5)
+    check("header row: a frame 2 rows too tall moves the header up 2",
+          m.header_row(4, frame, n - 1) == 3)
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
@@ -590,7 +666,7 @@ def main() -> int:
                    test_rows_added_while_running,
                    test_park_mode,
                    test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
-                   test_file_mode):
+                   test_file_mode, test_header_sort):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)
