@@ -13,6 +13,9 @@ token.csv.bak
 # Local state: cap cache, auto-rotate setting, SHA-256 token digests.
 data.json
 
+# Screenshots pasted into Claude Code sessions.
+.claude-images/
+
 # ─── build output ─────────────────────────────────────────────────────────────
 # `./build.sh` recreates all of this; the binary alone is ~11 MB.
 claude-token-rotate
