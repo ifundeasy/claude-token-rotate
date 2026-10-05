@@ -100,14 +100,14 @@ def test_both_windows_decide(d: str) -> None:
     """A credential is usable only while BOTH windows are under their limits."""
     check("5h 60% is usable", m.usable(reading(60, 10)))
     check("5h 61% is not", not m.usable(reading(61, 10)))
-    check("weekly 74% is usable", m.usable(reading(10, 74)))
-    check("weekly 75% is not", not m.usable(reading(10, 75)))
+    check("weekly 65% is usable", m.usable(reading(10, 65)))
+    check("weekly 66% is not", not m.usable(reading(10, 66)))
     check("a missing window is never usable", not m.usable({"u5h": "0.10"}))
     check("a spent credential is never usable",
           not m.usable({**reading(10, 10), "err": "unauthorized"}))
     # No weekend or working-day arithmetic: the weekly limit is the same whenever it resets.
-    soon = {**reading(10, 70), "r7d": str(time.time() + 3600)}
-    later = {**reading(10, 70), "r7d": str(time.time() + 6 * 86400)}
+    soon = {**reading(10, 60), "r7d": str(time.time() + 3600)}
+    later = {**reading(10, 60), "r7d": str(time.time() + 6 * 86400)}
     check("weekly limit ignores how far off the reset is", m.usable(soon) and m.usable(later))
 
     store = store_with(d, live=tok("L"), weekly_spent=tok("W"), good=tok("G"), hot=tok("H"))
@@ -301,9 +301,9 @@ def test_rotation_rules(d: str) -> None:
         return {**reading(p5, p7), "r5h": str(now + reset_in)}
 
     rot = (lambda r, pinned: m.needs_rotate(r, pinned, now=now)[0])
-    check("unpinned: under both limits stays", not rot(live(60, 74, 7200), False))
+    check("unpinned: under both limits stays", not rot(live(60, 65, 7200), False))
     check("unpinned: 5h 61% rotates", rot(live(61, 10, 7200), False))
-    check("unpinned: weekly 75% rotates", rot(live(10, 75, 7200), False))
+    check("unpinned: weekly 66% rotates", rot(live(10, 66, 7200), False))
     check("unpinned: a near 5h reset changes nothing", rot(live(61, 10, 600), False))
     check("pinned: under both limits stays", not rot(live(50, 10, 7200), True))
     check("pinned: 5h over, reset more than 1h away -> rotated", rot(live(70, 10, 7200), True))

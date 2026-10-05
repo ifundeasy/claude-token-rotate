@@ -115,7 +115,7 @@ carried the variable). This is **file mode**, the default.
 ### The limits
 
 ```
-usable      5h < 61%  (at most 60%)   and   weekly < 75%
+usable      5h < 61%  (at most 60%)   and   weekly < 66%
 trigger     the live credential is not usable, and 15s have passed since the last swap
             (checked after every refresh — `--interval`, default 60s)
 choose      among the usable ones, the soonest weekly reset;
@@ -461,7 +461,7 @@ alias ctr='python3 /path/to/claude-token-rotate/main.py'
 | `--cap USD\|auto\|off` | extra-credit cap; `auto` reads it from `/api/oauth/usage` |
 | `--env-file PATH` | shell file to manage (default `~/.zshenv`) |
 | `--limit-5h PCT` | a credential is usable while its 5h window is below this (default 61, i.e. at most 60%) |
-| `--limit-7d PCT` | a credential is usable while its weekly window is below this (default 75) |
+| `--limit-7d PCT` | a credential is usable while its weekly window is below this (default 66) |
 | `--export-env` | also export `CLAUDE_CODE_OAUTH_TOKEN` from the shell file (the old way — a restart per swap) |
 | `--auto-rotate` | start with auto-swap on |
 | `--no-env-write` | never write a shell file (nor the credentials file) |
