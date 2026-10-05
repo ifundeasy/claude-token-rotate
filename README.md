@@ -89,6 +89,11 @@ survive a rewrite, and rows with an empty token are skipped. Use `--csv PATH` fo
 | `a` `d` `e` | add · delete · edit a credential (name and/or token) |
 | **`t`** **`z`** **`T`** | **hand a token to Claude Code · switch to your /login and back · auto-swap off/park/on** |
 | `+` `-` `q` | interval · quit |
+| click a header | sort by that column; click it again to reverse (▼ highest or latest first, ▲ lowest or soonest first) |
+
+Clicking needs mouse reporting, and while it is on the terminal's own drag-to-select needs `Shift`
+held. `--no-mouse` turns it off. The two `RESET` headers sort by the soonest reset — the order
+auto-rotate spends quota in. Arrow keys are ignored rather than read as letters.
 
 ---
 
@@ -455,7 +460,8 @@ alias ctr='python3 /path/to/claude-token-rotate/main.py'
 | `--from-env [FILE]` | read from the environment instead of a CSV (list is read-only) |
 | `--only NAMES` | watch a subset |
 | `--interval N` `--timeout N` | seconds between refreshes · per-probe timeout |
-| `--view b\|h\|w\|o` `--sort` | initial view · initial order |
+| `--view b\|h\|w\|o` `--sort csv\|5h\|7d\|ov\|name\|r5h\|r7d` | initial view · initial order (`r5h`/`r7d`: soonest reset first) |
+| `--no-mouse` | no header clicks, so plain drag-to-select works without `Shift` |
 | `--alert PCT` | ring the terminal bell when a window crosses this |
 | `--log CSV` | append every reading for later analysis |
 | `--cap USD\|auto\|off` | extra-credit cap; `auto` reads it from `/api/oauth/usage` |

@@ -125,6 +125,8 @@ USAGE
     python3 main.py --view o                    # extra credits, cap auto-detected
     python3 main.py --view o --cap 5            # override the cap by hand
     python3 main.py --only alice,bob            # watch a subset
+    python3 main.py --sort r7d                  # soonest weekly reset first
+    python3 main.py --no-mouse                  # no header clicks; plain text selection
     python3 main.py --alert 80                  # bell when a window crosses 80%
     python3 main.py --log usage.csv             # append every reading for later analysis
     python3 main.py --once --json               # one machine-readable snapshot
@@ -140,6 +142,7 @@ USAGE
 KEYS
     views    h 5h    w 7d    o overage    b all
     read     r refresh now    s cycle sort    i inspect one credential's raw headers
+    mouse    click a column header to sort by it, click it again to reverse
     copy     1-9 that row's token    c any row by number    p furthest from any limit    x Markdown
     manage   a add credential    d delete    e edit name and/or token
     shell    t inject (pins it)    z switch on/off    T auto-rotate off|park|on
@@ -259,7 +262,13 @@ TITLE_SET = "\x1b]2;{}\x07"
 TITLE_MAX = 64                          # a tab label truncates long before this anyway
 TITLE_PUSH, TITLE_POP = "\x1b[22;2t", "\x1b[23;2t"
 SPARKS = "▁▂▃▄▅▆▇█"
-SORTS = ("csv", "5h", "7d", "ov", "name")
+SORTS = ("csv", "5h", "7d", "ov", "name", "r5h", "r7d")
+#: Orders that start highest-first: a utilization is read busiest-first. Everything else starts
+#: lowest-first — CSV order, A to Z, the reset that comes soonest. Reversing is a second click.
+SORT_DESC = frozenset({"5h", "7d", "ov"})
+#: Turn mouse reporting on and off: 1000 reports button presses, 1006 spells them as decimal
+#: text ("\x1b[<0;12;5M") instead of a byte offset that breaks past column 223.
+MOUSE_ON, MOUSE_OFF = "\x1b[?1000h\x1b[?1006h", "\x1b[?1006l\x1b[?1000l"
 
 
 # --------------------------------------------------------------------------- credential store
@@ -2175,9 +2184,30 @@ def fit(cols: list[Col], cols_avail: int, gap: int = 2, reserve: int = 12) -> li
         keep.remove(victim)
 
 
+#: Which order a click on a column header asks for. Bars, Δpp and the trend belong to the
+#: window they draw, so a click anywhere over a window sorts by it. TOKEN and STATE have no order.
+COL_SORT = {"idx": "csv", "name": "name", "u5": "5h", "d5": "5h", "b5": "5h", "t5": "5h",
+            "r5": "r5h", "u7": "7d", "b7": "7d", "r7": "r7d", "uo": "ov"}
+#: The columns that carry the ▲/▼ marker — one per order, never on a bar or a Δ.
+COL_MARK = frozenset({"idx", "name", "u5", "r5", "u7", "r7", "uo", "u", "reset"})
+
+
+def col_sort(key: str, mode: str) -> str | None:
+    """The sort order a header click on column `key` selects in view `mode`, or None."""
+    if key in ("u", "d", "bar", "trend"):
+        return {"h": "5h", "w": "7d", "o": "ov"}.get(mode)
+    if key == "reset":
+        return {"h": "r5h", "w": "r7d"}.get(mode)   # the extra pool's reset has no order
+    return COL_SORT.get(key)
+
+
 def table(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, *, mode: str,
-          color: bool, cols_avail: int) -> tuple[list[str], int]:
-    """Header rule + one line per credential, plus the width it actually needed.
+          color: bool, cols_avail: int, sort: str = "", desc: bool = False
+          ) -> tuple[list[str], int, list[tuple[int, int, str]]]:
+    """Header rule + one line per credential, the width it actually needed, and the click map.
+
+    The click map is (first column, last column, order) per sortable header, in 1-based terminal
+    columns, so a mouse report can be matched against it without re-deriving the layout.
 
     The flexible column is sized to its CONTENT, not to whatever the terminal happens to offer.
     A window three times wider than the data is not a reason to stretch a table across it — the
@@ -2211,11 +2241,24 @@ def table(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, *
         c.w = max(6, min(natural, max(10, cols_avail - fixed - 2)))
 
     used = min(cols_avail, sum(c.w for c in cols) + 2 * (len(cols) - 1) + 1)
-    head = "  ".join(pad(paint(c.head, DIM, color), c.w, c.align) for c in cols)
+    heads, hits, x = [], [], 2                  # x: 1-based column after the leading space
+    for c in cols:
+        order = col_sort(c.key, mode)
+        h = c.head
+        # The marker only goes where it fits: a header that overflows its width is clipped with
+        # an ellipsis, which would cost the label to show the arrow.
+        if order and order == sort and c.key in COL_MARK and c.head and len(h) + 1 <= c.w:
+            h += "▼" if desc else "▲"
+        heads.append(pad(paint(h, BOLD if order == sort and c.key in COL_MARK else DIM, color),
+                         c.w, c.align))
+        if order:
+            hits.append((x, x + c.w - 1, order))
+        x += c.w + 2
+    head = "  ".join(heads)
     out = [" " + head, " " + paint("─" * min(used, vlen(head)), DIM, color)]
     for row in cells:
         out.append(" " + "  ".join(pad(row[j], c.w, c.align) for j, c in enumerate(cols)))
-    return out, used
+    return out, used, hits
 
 
 def summary(store: Store, rows: list[dict[str, str]], results: dict, color: bool) -> list[str]:
@@ -2258,18 +2301,49 @@ TITLES = {"b": "CLAUDE QUOTA · 5h + 7d + extra credits",
 
 
 def sort_rows(store: Store, rows: list[dict[str, str]], results: dict,
-              how: str) -> list[dict[str, str]]:
-    """Order rows for display. Unreadable credentials sort last in every numeric order."""
+              how: str, desc: bool | None = None) -> list[dict[str, str]]:
+    """Order rows for display. `desc` None means the order's natural direction (SORT_DESC).
+
+    A credential with no reading, or no reset known, sorts last in BOTH directions: reversing
+    "busiest first" is meant to show the idlest ones, not to float the unreadable ones to the top.
+    """
+    if desc is None:
+        desc = how in SORT_DESC
     if how == "csv":
-        return list(rows)
+        return list(reversed(rows)) if desc else list(rows)
     if how == "name":
-        return sorted(rows, key=lambda r: store.name(r).lower())
-    field = {"5h": "u5h", "7d": "u7d", "ov": "uov"}[how]
+        return sorted(rows, key=lambda r: store.name(r).lower(), reverse=desc)
+    read = {"5h": lambda r: upct(r, "u5h"), "7d": lambda r: upct(r, "u7d"),
+            "ov": lambda r: upct(r, "uov"),
+            "r5h": lambda r: ureset(r, "r5h"), "r7d": lambda r: ureset(r, "r7d")}[how]
 
     def k(row):
-        p = upct(results.get(store.token(row), {}), field)
-        return (1, 0.0) if p is None else (0, -p)
+        v = read(results.get(store.token(row), {}))
+        return (1, 0.0) if v is None else (0, -v if desc else v)
     return sorted(rows, key=k)
+
+
+def header_row(line: int, frame: str, height: int) -> int:
+    """The 1-based terminal row the header sits on once `frame` is drawn from the top.
+
+    The frame is written from the home position and followed by a newline, so it needs one row
+    more than it has lines; past the window's height the terminal scrolls the top away, and the
+    header moves up with it — off screen (< 1) when the window is short enough.
+    """
+    return line + 1 - max(0, frame.count("\n") + 2 - height)
+
+
+def header_order(hits: dict, pos: tuple[int, int]) -> str | None:
+    """The order a click at (column, row) asks for, given where the last frame put the header."""
+    x, y = pos
+    if y != hits.get("row"):
+        return None
+    return next((o for x0, x1, o in hits.get("spans", ()) if x0 <= x <= x1), None)
+
+
+def sort_label(how: str, desc: bool) -> str:
+    """The order as the header names it, with its direction: "5h ▼", "r7d ▲"."""
+    return f"{how} {'▼' if desc else '▲'}"
 
 
 def human_epoch(val: str) -> tuple[str, bool]:
@@ -2372,8 +2446,12 @@ def live_note(results: dict, color: bool) -> tuple[str, str, str] | None:
 def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, *, mode: str,
            sort: str, interval: int, last: float, probes: int, flash: str, color: bool,
            cols: int, live: bool, alert: float | None, inspect: str | None,
-           diag: tuple[str, dict] | None = None, events: list[str] | None = None) -> str:
+           diag: tuple[str, dict] | None = None, events: list[str] | None = None,
+           desc: bool | None = None, hits: dict | None = None) -> str:
     """The whole frame as one string, so a redraw cannot tear.
+
+    `hits`, when given, is filled with where the table header landed: its 0-based line in the
+    frame and the column spans a click can sort by.
 
     The table is laid out first because it is what sets the width: the frame follows the data
     rather than the window. On a very wide terminal that leaves the right-hand side empty, which
@@ -2381,16 +2459,21 @@ def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, 
     not easier.
     """
     avail = max(48, cols - 1)
-    tbl, width = table(store, rows, results, hist, mode=mode, color=color, cols_avail=avail)
+    if desc is None:
+        desc = sort in SORT_DESC
+    tbl, width, spans = table(store, rows, results, hist, mode=mode, color=color,
+                              cols_avail=avail, sort=sort, desc=desc)
     width = max(48, min(avail, width))
     stamp = time.strftime("%H:%M:%S", time.localtime(last)) if last else "--:--:--"
-    meta = f"{stamp} · {sort} · {interval}s · {probes} probes"
+    meta = f"{stamp} · {sort_label(sort, desc)} · {interval}s · {probes} probes"
     if alert is not None:
         meta += f" · alert {alert:.0f}%"
     out: list[str] = []
     out += box(summary(store, rows, results, color), width, color,
                title=TITLES[mode], right=meta)
     out.append("")
+    if hits is not None:
+        hits.update(line=len(out), spans=spans)
     out += tbl
     out.append("")
 
@@ -2467,7 +2550,7 @@ def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, 
                 f"{g('t')}{d(' inject')}  {g('z')}{d(' on/off')}  {g('T')}"
                 + paint(" auto-rotate " + mode,
                         GREEN if mode == "on" else YELLOW if mode == "park" else DIM, color)]
-        right = [f"{g('r')}{d(' refresh')}  {g('s')}{d(' sort')}  {g('i')}{d(' raw')}  "
+        right = [f"{g('r')}{d(' refresh')}  {g('s')}{d('/click sort')}  {g('i')}{d(' raw')}  "
                  f"{g('D')}{d(' diagnose')}  {g('+/-')}{d(' interval')}",
                  f"{g('a')}{d(' add')}  {g('d')}{d(' delete')}  {g('e')}{d(' edit')}  "
                  f"{g('q')}{d(' quit')}",
@@ -2516,18 +2599,63 @@ def log_readings(path: str, store: Store, rows: list[dict[str, str]], results: d
 
 # --------------------------------------------------------------------------- keyboard + prompts
 
-class Keys:
-    """Single-keypress reader with no echo, restored on exit and pausable for line input."""
+def split_key(buf: str) -> tuple[str, str] | None:
+    """The first key in `buf` and what follows it, or None while an escape is still arriving.
 
-    def __init__(self) -> None:
+    A terminal sends an arrow or a mouse click as one escape sequence ("\x1b[D",
+    "\x1b[<0;12;5M"), and it has to come back as ONE key: read a byte at a time, the left arrow
+    was a stray `D` (diagnose) and every click typed its coordinates as row numbers to copy.
+    CSI runs to its final byte (0x40-0x7E), SS3 is three bytes, and an ESC followed by anything
+    else is a lone ESC.
+    """
+    if not buf:
+        return None
+    if buf[0] != "\x1b":
+        return buf[0], buf[1:]
+    if len(buf) == 1:
+        return None
+    if buf[1] == "[":
+        for i in range(2, len(buf)):
+            if "\x40" <= buf[i] <= "\x7e":
+                return buf[:i + 1], buf[i + 1:]
+        return None
+    if buf[1] == "O":
+        return (buf[:3], buf[3:]) if len(buf) >= 3 else None
+    return buf[0], buf[1:]
+
+
+def mouse_click(key: str) -> tuple[int, int] | None:
+    """(column, row), 1-based, for a left-button PRESS in SGR mouse encoding; None otherwise.
+
+    The release (final `m`), the wheel (button 64/65) and the other buttons are not clicks.
+    """
+    m = re.fullmatch(r"\x1b\[<(\d+);(\d+);(\d+)M", key)
+    if not m or int(m.group(1)) != 0:
+        return None
+    return int(m.group(2)), int(m.group(3))
+
+
+class Keys:
+    """Single-keypress reader with no echo, restored on exit and pausable for line input.
+
+    With `mouse`, the terminal reports clicks while keys are being read and stops while a line is
+    being typed — a click during `input()` would otherwise land in the answer as escape bytes.
+    """
+
+    def __init__(self, mouse: bool = False) -> None:
         self.unix = sys.stdin.isatty() and os.name != "nt"
         self.win = os.name == "nt" and sys.stdin.isatty()
+        self.mouse = mouse and self.unix and sys.stdout.isatty()
         self._saved = None
+        self._buf = ""
 
     def _raw(self) -> None:
         if self.unix:
             import tty
             tty.setcbreak(sys.stdin.fileno())
+        if self.mouse:
+            sys.stdout.write(MOUSE_ON)
+            sys.stdout.flush()
 
     def __enter__(self) -> "Keys":
         if self.unix:
@@ -2541,12 +2669,33 @@ class Keys:
 
     def cooked(self) -> None:
         """Restore line-editing mode so `input()` and `getpass` behave normally."""
+        if self.mouse:
+            sys.stdout.write(MOUSE_OFF)
+            sys.stdout.flush()
+        self._buf = ""                           # keys typed before a prompt are not its answer
         if self.unix and self._saved is not None:
             import termios
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved)
 
     def raw(self) -> None:
         self._raw()
+
+    def _fill(self, wait: float) -> bool:
+        """Append whatever the terminal has sent within `wait` seconds. False when nothing came.
+
+        os.read, not sys.stdin.read: the text wrapper slurps a whole escape sequence into its own
+        buffer on the first byte, and select() on the descriptor then reports nothing left — the
+        rest of the sequence would sit there until the next keypress.
+        """
+        import select
+        r, _, _ = select.select([sys.stdin], [], [], wait)
+        if not r:
+            return False
+        data = os.read(sys.stdin.fileno(), 1024)
+        if not data:
+            return False
+        self._buf += data.decode(errors="ignore")
+        return True
 
     def get(self, wait: float) -> str:
         """One key within `wait` seconds, or '' on timeout."""
@@ -2564,9 +2713,22 @@ class Keys:
         if not self.unix:
             time.sleep(wait)
             return ""
-        import select
-        r, _, _ = select.select([sys.stdin], [], [], wait)
-        return sys.stdin.read(1) if r else ""
+        if not self._buf and not self._fill(wait):
+            return ""
+        got = split_key(self._buf)
+        # An escape split across two reads: the rest follows within a few milliseconds. If it
+        # does not, the fragment is dropped rather than replayed as keys.
+        for _ in range(3):
+            if got is not None:
+                break
+            if not self._fill(0.05):
+                break
+            got = split_key(self._buf)
+        if got is None:
+            self._buf = ""
+            return "\x1b"
+        key, self._buf = got
+        return key
 
 
 def ask(keys: Keys, prompt: str, secret: bool = False) -> str:
@@ -2636,7 +2798,11 @@ def main() -> int:
     ap.add_argument("--view", choices=("b", "h", "w", "o"), default="b",
                     help="b=all windows, h=5h, w=7d, o=extra credits")
     ap.add_argument("--sort", choices=SORTS, default="csv",
-                    help="initial row order; 'ov' sorts by extra-credit spend")
+                    help="initial row order; 'ov' sorts by extra-credit spend, 'r5h'/'r7d' by "
+                         "the soonest reset")
+    ap.add_argument("--no-mouse", action="store_true",
+                    help="do not take mouse clicks (header sorting), so the terminal's own text "
+                         "selection works without holding Shift")
     ap.add_argument("--alert", type=float, metavar="PCT",
                     help="ring the terminal bell when a window crosses this percentage")
     ap.add_argument("--log", metavar="CSV", help="append every reading to this CSV")
@@ -2707,6 +2873,7 @@ def main() -> int:
     resolve_cap(explicit, [store.token(r) for r in store.rows], args.timeout)
     color = not args.no_color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     interval, mode, sort = max(5, args.interval), args.view, args.sort
+    desc = sort in SORT_DESC
     hist: dict[str, dict[str, list[tuple[float, float]]]] = {}
     alerted: set[str] = set()
     #: Last (reset instant, utilization) per credential per window — the pair a drop is judged by.
@@ -2979,7 +3146,8 @@ def main() -> int:
     if live_tty:
         sys.stdout.write(ALT_ON + HIDE + (TITLE_PUSH if title_on else ""))
     try:
-        with Keys() as keys:
+        with Keys(mouse=live_tty and not args.no_mouse) as keys:
+            hits: dict = {}
             while True:
                 swept = False
                 if time.time() >= due:
@@ -3002,7 +3170,7 @@ def main() -> int:
                             elif hot < args.alert:
                                 alerted.discard(tok)
 
-                rows = sort_rows(store, store.rows, results, sort)
+                rows = sort_rows(store, store.rows, results, sort, desc)
                 if swept:
                     for msg in (warn_if_in_use(results), auto_swap(results, rows)):
                         if msg:
@@ -3014,16 +3182,29 @@ def main() -> int:
                     if t != last_title:            # only on change: some terminals redraw the tab
                         sys.stdout.write(TITLE_SET.format(t))
                         last_title = t
+                size = shutil.get_terminal_size((110, 24))
                 frame = render(store, rows, results, hist, mode=mode, sort=sort,
                                interval=interval, last=last, probes=probes, flash=flash,
-                               color=color, cols=shutil.get_terminal_size((110, 24)).columns,
+                               color=color, cols=size.columns,
                                live=True, alert=args.alert, inspect=inspect, diag=diag,
-                               events=events)
+                               events=events, desc=desc, hits=hits)
                 sys.stdout.write((HOME if live_tty else "\n") + frame + "\n")
                 sys.stdout.flush()
+                hits["row"] = header_row(hits.get("line", -1), frame, size.lines)
 
                 key = keys.get(min(1.0, max(0.2, due - time.time())) if due > time.time() else 0.2)
                 if not key:
+                    continue
+                if key.startswith("\x1b"):
+                    # Arrows, function keys and anything but a click on a header do nothing, and
+                    # leave the flash where it was.
+                    pos = mouse_click(key)
+                    order = header_order(hits, pos) if pos else None
+                    if order is None:
+                        continue
+                    desc = (not desc) if order == sort else order in SORT_DESC
+                    sort = order
+                    flash = f"sorted by {sort_label(sort, desc)} — click again to reverse"
                     continue
                 flash = ""
                 if key in ("q", "Q", "\x03", "\x04"):
@@ -3034,7 +3215,8 @@ def main() -> int:
                     due = 0.0
                 elif key == "s":
                     sort = SORTS[(SORTS.index(sort) + 1) % len(SORTS)]
-                    flash = f"sorted by {sort}"
+                    desc = sort in SORT_DESC
+                    flash = f"sorted by {sort_label(sort, desc)}"
                 elif key in ("+", "="):
                     interval = min(3600, interval * 2)
                     due = last + interval
