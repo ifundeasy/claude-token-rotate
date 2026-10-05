@@ -92,8 +92,10 @@ survive a rewrite, and rows with an empty token are skipped. Use `--csv PATH` fo
 | click a header | sort by that column; click it again to reverse (▼ highest or latest first, ▲ lowest or soonest first) |
 
 Clicking needs mouse reporting, and while it is on the terminal's own drag-to-select needs `Shift`
-held. `--no-mouse` turns it off. The two `RESET` headers sort by the soonest reset — the order
-auto-rotate spends quota in. Arrow keys are ignored rather than read as letters.
+held. `--no-mouse` turns it off. The two `RESET` headers sort by the soonest reset of their own window.
+The 7D one is close to the order auto-rotate spends quota in, though auto-rotate only weighs usable
+credentials and looks at the 5h reset just to break near ties. Arrow keys are ignored rather than
+read as letters.
 
 ---
 

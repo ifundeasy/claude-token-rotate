@@ -633,7 +633,7 @@ def test_header_sort(d: str) -> None:
                      hits=hits)
     lines = frame.split("\n")
     head = lines[hits["line"]]
-    hits["row"] = m.header_row(hits["line"], frame, 200)
+    hits["row"] = m.header_row(hits["line"], frame, 200, 400)
     at = {}
     for x0, x1, order in hits["spans"]:
         at.setdefault(head[x0 - 1:x1].strip(), order)
@@ -652,9 +652,29 @@ def test_header_sort(d: str) -> None:
     check("a click on TOKEN does nothing",
           m.header_order(hits, (head.index("TOKEN") + 1, hits["row"])) is None)
     n = frame.count("\n") + 1
-    check("header row: a frame that fits stays put", m.header_row(4, frame, n + 1) == 5)
+    check("header row: a frame that fits stays put", m.header_row(4, frame, n + 1, 400) == 5)
     check("header row: a frame 2 rows too tall moves the header up 2",
-          m.header_row(4, frame, n - 1) == 3)
+          m.header_row(4, frame, n - 1, 400) == 3)
+    wide = "x\n" + "y" * 25 + "\nHEADER\nz"            # line 1 wraps onto 3 rows at width 10
+    check("header row: a wrapped line above pushes the header down",
+          m.header_row(2, wide, 50, 10) == 5)
+    check("header row: a line exactly as wide as the window is one row",
+          m.header_row(2, "x\n" + "y" * 10 + "\nHEADER", 50, 10) == 3)
+    check("header row: wrapped rows count toward the scroll",
+          m.header_row(2, wide, 6, 10) == 4)
+
+    x10 = "\x1b[M" + chr(32) + chr(32 + 52) + chr(32 + 7)
+    check("split_key: a legacy mouse report is one key, its bytes not replayed as T/z/q",
+          m.split_key(x10 + "s") == (x10, "s"))
+    check("split_key: a legacy report still arriving waits", m.split_key("\x1b[M ") is None)
+    check("mouse_click: legacy left press", m.mouse_click(x10) == (52, 7))
+    check("mouse_click: legacy release is not a click",
+          m.mouse_click("\x1b[M" + chr(35) + chr(32 + 52) + chr(32 + 7)) is None)
+    far = b"\x1b[M " + bytes([32 + 140, 32 + 7])          # column past 95: not UTF-8
+    check("a legacy report past column 95 keeps all six characters",
+          m.split_key(far.decode(errors="surrogateescape") + "q")[1] == "q")
+    check("the flash line is there even when empty, so a click cannot scroll the frame",
+          frame.split("\n")[-1] == "")
 
 
 def main() -> int:
