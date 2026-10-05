@@ -53,7 +53,7 @@ THE LIVE CREDENTIAL. One credential is the one Claude Code actually uses, and th
 shows it (cyan in the NAME column) and can change it. `t` hands a chosen token over, `z` switches
 back to your /login and forward again, and `T` cycles what auto-rotate is allowed to do.
 
-    usable      5h < LIMIT_5H (61, so at most 60%)  and  weekly < LIMIT_7D (75)
+    usable      5h < LIMIT_5H (61, so at most 60%)  and  weekly < LIMIT_7D (66)
     trigger     the live credential is not usable
                 and at least ROTATE_GAP seconds since the last swap
     choose      among the usable ones, the soonest weekly reset — then, between weekly
@@ -184,7 +184,7 @@ ENV_FILE = os.path.expanduser("~/.zshenv")
 #: as either is reached, and a replacement has to be under both. Utilization is published in whole
 #: percentage points, so 61 means "at most 60%". `--limit-5h` / `--limit-7d` override them.
 LIMIT_5H = 61.0
-LIMIT_7D = 75.0
+LIMIT_7D = 66.0
 ROTATE_GAP = 15.0                       # seconds between automatic swaps, so nothing thrashes
 #: The slack a PINNED credential gets. When its 5h window resets within PIN_GRACE seconds the quota
 #: is about to come back, so it is kept past the limit — until its 5h reaches PIN_CEILING.
