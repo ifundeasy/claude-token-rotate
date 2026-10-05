@@ -2323,14 +2323,47 @@ def sort_rows(store: Store, rows: list[dict[str, str]], results: dict,
     return sorted(rows, key=k)
 
 
-def header_row(line: int, frame: str, height: int) -> int:
+def hold_terminal(keys: "Keys", title_on: bool) -> None:
+    """Put the terminal back on a kill, a hangup or Ctrl-Z, not only on `q`.
+
+    The default actions for these signals skip every `with` and `finally`, so the shell came back
+    with mouse reporting still on — each click then typed an escape sequence into the command
+    line. SIGTERM and SIGHUP become an exit, which runs the normal cleanup. SIGTSTP restores the
+    terminal, stops for real, and takes the dashboard back over on `fg`; the next frame redraws.
+    """
+    import signal
+
+    def leave(sig, _frame):
+        raise SystemExit(128 + sig)
+
+    def suspend(sig, _frame):
+        keys.cooked()
+        sys.stdout.write(SHOW + ALT_OFF + (TITLE_POP if title_on else ""))
+        sys.stdout.flush()
+        signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTSTP)
+        # Execution resumes here on SIGCONT.
+        signal.signal(signal.SIGTSTP, suspend)
+        sys.stdout.write(ALT_ON + HIDE + (TITLE_PUSH if title_on else ""))
+        sys.stdout.flush()
+        keys.raw()
+
+    signal.signal(signal.SIGTERM, leave)
+    signal.signal(signal.SIGHUP, leave)
+    signal.signal(signal.SIGTSTP, suspend)
+
+
+def header_row(line: int, frame: str, height: int, width: int) -> int:
     """The 1-based terminal row the header sits on once `frame` is drawn from the top.
 
-    The frame is written from the home position and followed by a newline, so it needs one row
-    more than it has lines; past the window's height the terminal scrolls the top away, and the
-    header moves up with it — off screen (< 1) when the window is short enough.
+    Counted in screen rows, not lines: a line wider than the window wraps onto more. The frame is
+    written from the home position and followed by a newline, so it needs one row more than it
+    occupies; past the window's height the terminal scrolls the top away, and the header moves up
+    with it — off screen (< 1) when the window is short enough. A line exactly `width` wide is
+    one row, because the terminal holds the wrap until the next character.
     """
-    return line + 1 - max(0, frame.count("\n") + 2 - height)
+    rows = [max(1, -(-vlen(ln) // max(1, width))) for ln in frame.split("\n")]
+    return 1 + sum(rows[:line]) - max(0, sum(rows) + 1 - height)
 
 
 def header_order(hits: dict, pos: tuple[int, int]) -> str | None:
@@ -2562,8 +2595,9 @@ def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, 
         right += [""] * (n - len(right))
         half = (width - 6) // 2
         out += box([pad(left[i], half) + "  " + right[i] for i in range(n)], width, color)
-    if flash:
-        out.append(" " + paint("▸ " + flash, MAGENTA, color))
+    # The flash line is always there, blank or not: appearing on the first click would scroll an
+    # overflowing frame by a row, and the second click on the same header would miss it.
+    out.append(" " + paint("▸ " + flash, MAGENTA, color) if flash else "")
     return "\n".join(out)
 
 
@@ -2614,6 +2648,11 @@ def split_key(buf: str) -> tuple[str, str] | None:
         return buf[0], buf[1:]
     if len(buf) == 1:
         return None
+    # The legacy report a terminal without mode 1006 sends: ESC [ M then three raw bytes (button,
+    # column, row, each plus 32). Its `M` looks like a CSI final byte, and stopping there would
+    # replay the three bytes as keys — a click typing `T`, `z` or `q`.
+    if buf.startswith("\x1b[M"):
+        return (buf[:6], buf[6:]) if len(buf) >= 6 else None
     if buf[1] == "[":
         for i in range(2, len(buf)):
             if "\x40" <= buf[i] <= "\x7e":
@@ -2627,8 +2666,11 @@ def split_key(buf: str) -> tuple[str, str] | None:
 def mouse_click(key: str) -> tuple[int, int] | None:
     """(column, row), 1-based, for a left-button PRESS in SGR mouse encoding; None otherwise.
 
-    The release (final `m`), the wheel (button 64/65) and the other buttons are not clicks.
+    The release (final `m`), the wheel (button 64/65) and the other buttons are not clicks. The
+    legacy six-byte form is read too, so a terminal without SGR mode still sorts on a click.
     """
+    if len(key) == 6 and key.startswith("\x1b[M"):
+        return (ord(key[4]) - 32, ord(key[5]) - 32) if key[3] == " " else None
     m = re.fullmatch(r"\x1b\[<(\d+);(\d+);(\d+)M", key)
     if not m or int(m.group(1)) != 0:
         return None
@@ -2675,7 +2717,9 @@ class Keys:
         self._buf = ""                           # keys typed before a prompt are not its answer
         if self.unix and self._saved is not None:
             import termios
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved)
+            # TCSAFLUSH: clicks and keys that arrived while the dashboard was busy are dropped
+            # with the buffer above, instead of landing in the prompt's answer.
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, self._saved)
 
     def raw(self) -> None:
         self._raw()
@@ -2694,7 +2738,9 @@ class Keys:
         data = os.read(sys.stdin.fileno(), 1024)
         if not data:
             return False
-        self._buf += data.decode(errors="ignore")
+        # surrogateescape, not ignore: a legacy mouse report past column 95 carries a byte that is
+        # not UTF-8, and dropping it would cut the six-byte report short and eat the next key.
+        self._buf += data.decode(errors="surrogateescape")
         return True
 
     def get(self, wait: float) -> str:
@@ -3148,6 +3194,8 @@ def main() -> int:
     try:
         with Keys(mouse=live_tty and not args.no_mouse) as keys:
             hits: dict = {}
+            if live_tty and os.name != "nt":
+                hold_terminal(keys, title_on)
             while True:
                 swept = False
                 if time.time() >= due:
@@ -3190,7 +3238,7 @@ def main() -> int:
                                events=events, desc=desc, hits=hits)
                 sys.stdout.write((HOME if live_tty else "\n") + frame + "\n")
                 sys.stdout.flush()
-                hits["row"] = header_row(hits.get("line", -1), frame, size.lines)
+                hits["row"] = header_row(hits.get("line", -1), frame, size.lines, size.columns)
 
                 key = keys.get(min(1.0, max(0.2, due - time.time())) if due > time.time() else 0.2)
                 if not key:
