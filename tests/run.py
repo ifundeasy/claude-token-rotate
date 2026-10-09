@@ -305,7 +305,7 @@ def test_rotation_rules(d: str) -> None:
     check("unpinned: under both limits stays", not rot(live(60, 65, 7200), False))
     check("unpinned: 5h 61% rotates", rot(live(61, 10, 7200), False))
     check("unpinned: weekly 66% rotates", rot(live(10, 66, 7200), False))
-    check("unpinned: a near 5h reset changes nothing", rot(live(61, 10, 600), False))
+    check("unpinned: a near 5h reset holds it too, like a pin", not rot(live(61, 10, 600), False))
     check("pinned: under both limits stays", not rot(live(50, 10, 7200), True))
     check("pinned: 5h over, reset more than 1h away -> rotated", rot(live(70, 10, 7200), True))
     check("pinned: 5h over, reset in 45 min -> held", not rot(live(70, 10, 2700), True))
@@ -1190,6 +1190,59 @@ def test_unseen_counts_as_idle(d: str) -> None:
           still[tok("A")][1] == 99999.0 - 7200.0)
 
 
+def test_idle_and_nights_hold(d: str) -> None:
+    """Review of the idle clock and the night hours: use across a gap is use, a 5h reset reads
+    about 0, a night window that does not cross midnight is not all day, and holidays.txt
+    tolerates a BOM and a comma."""
+    still: dict = {}
+    m.track_still(still, {tok("A"): reading(18, 40)}, 1000.0, max_gap=180.0, unseen_idle=7200.0)
+    m.track_still(still, {tok("A"): reading(22, 40)}, 1240.0, max_gap=180.0, unseen_idle=7200.0)
+    check("gap: readings that moved across it are use", still[tok("A")][1] == 1240.0)
+    m.track_still(still, {tok("A"): reading(22, 40)}, 1500.0, max_gap=180.0, unseen_idle=7200.0)
+    check("gap: unchanged readings never get more idle than the benefit of the doubt",
+          still[tok("A")][1] == max(1500.0 - 7200.0, 1240.0))
+    s2: dict = {}
+    m.track_still(s2, {tok("B"): reading(40, 30)}, 0.0)
+    m.track_still(s2, {tok("B"): reading(25, 30)}, 60.0)
+    check("a 5h drop that lands well above 0 is not a reset", s2[tok("B")][1] == 60.0)
+
+    at = (lambda h, mi=0: datetime.datetime(2026, 10, 8, h, mi).timestamp())   # a Thursday
+    check("night 1-5: 03:00 is off, 12:00 is not",
+          m.day_off(at(3), set(), night_from=1, night_until=5)
+          and not m.day_off(at(12), set(), night_from=1, night_until=5))
+    check("night 7-7: no nights at all", not m.day_off(at(3), set(), night_from=7, night_until=7)
+          and not m.day_off(at(12), set(), night_from=7, night_until=7))
+    check("off_ends: on a Thursday night, off hours end at 07:00",
+          datetime.datetime.fromtimestamp(m.off_ends(at(23))).hour == 7)
+
+    hol = os.path.join(d, "bom-holidays.txt")
+    with open(hol, "w", encoding="utf-8-sig") as fh:
+        fh.write("2026-12-25,Natal\n2026-W52-5\n20261226\n")
+    got = m.load_holidays(hol)
+    check("holidays: a BOM and a comma are fine, other date forms are not", got == {"2026-12-25"})
+
+
+def test_fewer_swaps(d: str) -> None:
+    """Our own use is not somebody else's; a replacement has room to spare."""
+    still: dict = {}
+    m.track_still(still, {tok("A"): reading(10, 20)}, 0.0, live=tok("A"))
+    m.track_still(still, {tok("A"): reading(30, 25)}, 600.0, live=tok("A"))
+    check("own use: rises while it is live here do not restart its clock", still[tok("A")][1] == 0.0)
+    m.track_still(still, {tok("A"): reading(31, 25)}, 1200.0, live=tok("B"))
+    check("…but a rise once it is not live here does", still[tok("A")][1] == 1200.0)
+
+    store = store_with(d, tight=tok("T"), roomy=tok("R"))
+    now = time.time()
+    res = {tok("T"): {**reading(10, 64), "r7d": str(now + 3600)},
+           tok("R"): {**reading(10, 40), "r7d": str(now + 5 * 86400)}}
+    pick = m.rotate_pick(store, store.rows, res, strict=True)
+    check("headroom: 64% weekly against 66 loses to one with room, despite the sooner reset",
+          pick is not None and store.name(pick[0]) == "roomy")
+    only = {tok("T"): res[tok("T")]}
+    pick = m.rotate_pick(store, store.rows, only, strict=True)
+    check("headroom: a tight one still beats nothing", pick is not None and store.name(pick[0]) == "tight")
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
@@ -1200,7 +1253,7 @@ def main() -> int:
                    test_park_mode,
                    test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
                    test_file_mode, test_header_sort, test_burn_before_weekly_reset, test_holiday_file,
-                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle):
+                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle, test_idle_and_nights_hold, test_fewer_swaps):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

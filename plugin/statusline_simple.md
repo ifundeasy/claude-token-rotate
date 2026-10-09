@@ -1,6 +1,7 @@
 #!/bin/bash
 # Simple one-row status line:
-#   <model> / <effort> │ <name> ...<token tail> │ 5h X% / <reset in> │ 7d Y% / <reset in>
+#   <model> <effort> │ <name> ...<token tail> │ <5h %> <reset in> │ <7d %> <reset in>
+# The two window cells are always in that order, 5h then 7d, so they carry no label.
 #
 # A separate, smaller sibling of statusline_command.md (the 2-row grid), which this
 # leaves alone. Same identity rule as the grid, trimmed: the token comes from the
@@ -90,27 +91,27 @@ IFS=$'\x1f' read -r p5 p7 r5 r7 model effort _ <<< "$(printf '%s' "$input" | jq 
     (.effort.level // ""),
     "" ] | join("\u001f")' 2>/dev/null)"
 
-# The model block: name bold cyan, then "/ effort" in gray. Claude Code does
+# The model block: name bold cyan, then the effort in gray. Claude Code does
 # not put the permission mode (auto, plan, ...) in the payload, so it cannot be shown.
 model="${model//[^[:print:]]/}"; effort="${effort//[^[:print:]]/}"
 head=""
 if [ -n "$model" ]; then
   head="${BOLD}"$'\033[36m'"${model:0:40}${RESET}"
-  [ -n "$effort" ] && head="${head} ${DIM}/ ${effort}${RESET}"
+  [ -n "$effort" ] && head="${head} ${DIM}${effort}${RESET}"
 fi
 
-# One cell per window: "5h 59% / 1h20m". A window the payload does not carry is
-# left out, and so is a reset it does not give.
+# One cell per window: "59% 1h 20m". A window the payload does not carry is left
+# out, and so is a reset it does not give.
 sep=" ${DIM}│${RESET} "
-cell() { # $1 label, $2 pct, $3 reset-in
-  pct_color "$2"
-  REPLY="${DIM}$1${RESET} ${REPLY}$2%${RESET}"
-  [ -n "$3" ] && REPLY="${REPLY} ${DIM}/ ${3//[^[:print:]]/}${RESET}"
+cell() { # $1 pct, $2 reset-in
+  pct_color "$1"
+  REPLY="${REPLY}$1%${RESET}"
+  [ -n "$2" ] && REPLY="${REPLY} ${DIM}${2//[^[:print:]]/}${RESET}"
 }
 for w in 5h 7d; do
   if [ "$w" = 5h ]; then p="$p5" r="$r5"; else p="$p7" r="$r7"; fi
   [ -n "$p" ] || continue
-  cell "$w" "$p" "$r"
+  cell "$p" "$r"
   [ -n "$line" ] && line="${line}${sep}${REPLY}" || line="$REPLY"
 done
 [ -n "$head" ] && { [ -n "$line" ] && line="${head}${sep}${line}" || line="$head"; }

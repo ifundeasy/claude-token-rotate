@@ -158,16 +158,21 @@ usable, auto-rotate stays put and says so once.
 
 The limits decide when the live credential **has** to go. Rebalance decides when it **should**:
 while it is fine, a usable credential whose weekly reset comes more than an hour
-(`CTR_RESET_TIE`) sooner takes over — whatever it has left is lost sooner. Only with `T` on, never
+(`CTR_RESET_TIE`) sooner takes over — whatever it has left is lost sooner. It skips a credential whose
+readings moved in the last 30 minutes (`CTR_REBALANCE_IDLE`) — somebody is on it; this machine's
+own use does not count. Every replacement, here and in ordinary rotation, prefers one with 5 points
+to spare below each limit (`CTR_MIN_HEADROOM`), so a swap is not followed by another. Only with `T` on, never
 over a pin, never more often than `CTR_ROTATE_GAP`. `CTR_REBALANCE=false` turns it off, leaving
 rotation to the limits alone.
 
 ### Pinned credentials
 
-`p` pins the credential you picked. Auto-rotate still moves a pinned credential, with one
-allowance — when its quota is about to come back, it is worth riding out:
+`p` pins the credential you picked; the pin lifts by itself when that credential's week resets,
+or with `u`. Auto-rotate still moves the live credential — pinned or not — with one allowance:
+when its 5h quota is about to come back, it is worth riding out (rotating away only for rebalance
+to bring it back after the 5h reset was the commonest swap of all):
 
-| Pinned credential | Auto-rotate |
+| Live credential | Auto-rotate |
 |---|---|
 | under both limits | keeps it |
 | over the 5h limit, window resets **within 1 hour** | keeps it **until 5h reaches 95%** |
@@ -214,9 +219,12 @@ and the footer says so, only for as long as **all** of these still hold:
 - nobody swapped by hand (`p`, `z`, or `e` on the live row end it).
 
 Then the ordinary rules take over. A pin made with `p` outranks it. It survives a restart
-(`data.json`, as a digest). Time nobody watched does not count as idle: after a restart, a sleep,
-or hours of failed probes, a credential has to be watched for the full 2 hours again. It only acts
-with `T` on — in `park` and `off` it does nothing.
+(`data.json`, as a digest). The idle clock is kept in `data.json` too. A credential not watched
+yet, or not watched for a while (a restart, a sleep, failed probes), counts as idle at once
+(`CTR_BURN_UNSEEN`; `false` makes it wait the full 2 hours) — unless its readings moved across that
+gap, which is use: then it waits like any other. A drop in 5h counts as a reset only when it reads
+about 0%. It only acts with `T` on — in `park` and `off` it does nothing. `p`, `z` or `e` end a
+hold; it starts again only if the rules pick that credential afresh.
 `CTR_BURN_WINDOW` and `CTR_BURN_IDLE` (minutes) and `CTR_BURN` in `.env` — or `--burn-window`,
 `--burn-idle`, `--no-burn` — change or disable it.
 
@@ -411,11 +419,11 @@ carol sk...3zR8nAAA       │ Session 414.2k (99%) │  ⚠ $12.80 · $0.04/min 
 `plugin/statusline_simple.md` is the one-row alternative:
 
 ```
-Opus 5.5 / xhigh │ Wita ...R9LetgAA │ 5h 59% / 1h 02m │ 7d 77% / 2d 3h
+Opus 5.5 xhigh │ Nico ...rlMiTwAA │ 88% 2h 41m │ 81% 4h 31m
 ```
 
-model / effort, the credential (name and the last 8 characters of its token), then each window's
-use and the time to its reset. It names the credential by the same rule as the grid below. Point
+model and effort, the credential (name and the last 8 characters of its token), then the 5h and
+the weekly window — always in that order — each as use and the time to its reset. It names the credential by the same rule as the grid below. Point
 `statusLine.command` at whichever of the two you want.
 
 The **account** cell (row two, first column) is what ties this to the dashboard. It names the
@@ -573,7 +581,7 @@ where it came from — a typo cannot silently do nothing. Relative paths are tak
 | `CTR_LIMIT_7D` | `--limit-7d PCT` | `66` | usable while weekly is below this (at most 65%) |
 | `CTR_ROTATE_GAP` | `--rotate-gap SEC` | `15` | least time between two automatic swaps |
 | `CTR_RESET_TIE` | `--reset-tie MIN` | `60` | weekly resets this close tie, and the 5h reset decides |
-| `CTR_PIN_GRACE` | `--pin-grace MIN` | `60` | a pinned credential over 5h is kept when 5h resets within this… |
+| `CTR_PIN_GRACE` | `--pin-grace MIN` | `60` | the live credential (pinned or not) over 5h is kept when 5h resets within this… |
 | `CTR_PIN_CEILING` | `--pin-ceiling PCT` | `95` | …until its 5h reaches this |
 | `CTR_BURN` | `--[no-]burn` | `true` | spend a week down before it resets, on days off |
 | `CTR_BURN_WINDOW` | `--burn-window MIN` | `420` | …when the weekly reset is under this far away (7h) |
@@ -581,6 +589,8 @@ where it came from — a typo cannot silently do nothing. Relative paths are tak
 | `CTR_BURN_MIN` | `--burn-min MIN` | `15` | …but not with less than this left before the reset |
 | `CTR_BURN_UNSEEN` | `--[no-]burn-unseen` | `true` | a credential not watched yet counts as idle (no 2h wait after a start) |
 | `CTR_REBALANCE` | `--[no-]rebalance` | `true` | move to a usable credential whose week resets sooner |
+| `CTR_REBALANCE_IDLE` | `--rebalance-idle MIN` | `30` | …but not onto one whose readings moved this recently (somebody is on it) |
+| `CTR_MIN_HEADROOM` | `--min-headroom PCT` | `5` | a replacement needs this many points below each limit, if any has them |
 | `CTR_NIGHT_FROM` | `--night-from HOUR` | `22` | every night from this hour counts as off hours (`24` = no nights) |
 | `CTR_NIGHT_UNTIL` | `--night-until HOUR` | `7` | …until this hour in the morning (`0` = nights end at midnight) |
 | `CTR_ENV_WRITE` | `--[no-]env-write` | `true` | write the shell file at all (false: `p`/`T`/`z` read-only) |
