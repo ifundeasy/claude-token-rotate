@@ -213,6 +213,12 @@ RESET_TIE = 3600.0
 #: CTR_BURN_WINDOW / CTR_BURN_IDLE (minutes) and CTR_BURN in .env, or the matching flags, change them.
 BURN_WINDOW = 7 * 3600.0
 BURN_IDLE = 2 * 3600.0
+#: A replacement needs this many points left below each limit: 64% weekly against a 66 limit
+#: lasted forty minutes and cost a second swap. Falls back to any usable one when none has it.
+MIN_HEADROOM = 5.0
+#: A credential whose readings moved this recently is somebody's working budget: rebalance does
+#: not move onto it (rotation away from a spent one still may, when nothing else is usable).
+REBALANCE_IDLE = 30 * 60.0
 #: Too close to the reset to be worth two swaps: a spend-down needs at least this long left.
 BURN_MIN = 15 * 60.0
 #: Off hours, local time: every night from NIGHT_FROM to NIGHT_UNTIL counts like a day off — the
@@ -874,6 +880,9 @@ def resolve_cap(explicit: float | None, tokens: list[str], timeout: float) -> No
         CAP_USD, CAP_SRC = found[0], found[2]
     else:
         CAP_SRC = why
+    # Re-read before writing: the /usage calls above take seconds, and the dashboard that writes
+    # may have recorded a pin or a spend-down meanwhile. Only the keys this owns are replaced.
+    state = load_state()
     state["scopes"] = scopes
     if POOL.get("cap"):
         state["pool"] = {k: POOL.get(k) for k in ("cap", "used", "src", "ts")}
@@ -1302,7 +1311,7 @@ def toggle_live(env_path: str, creds_path: str, store: "Store", file_mode: bool,
         return creds_restore(creds_path), False
     tok = str(env_state(env_path, store)["token"] or "")
     if not tok:
-        raise RuntimeError(f"no token recorded in {os.path.basename(env_path)} — t picks one")
+        raise RuntimeError(f"no token recorded in {os.path.basename(env_path)} — p picks one")
     return creds_inject(creds_path, tok), True
 
 
@@ -1431,10 +1440,11 @@ def needs_rotate(r: dict[str, object], pinned: bool,
                  now: float | None = None) -> tuple[bool, str]:
     """Whether auto-rotate should move off the live credential, and a line saying why (or why not).
 
-    Unpinned: as soon as it is not usable. Pinned — chosen by hand with `p` — the same, with one
-    allowance: over on the 5h window only, with that window resetting within PIN_GRACE, it is kept
-    until PIN_CEILING, because the quota is about to come back and the choice was a person's. A
-    spent credential, a weekly overrun, or a reset further off moves it like any other.
+    As soon as it is not usable, with one allowance for every live credential, pinned or not:
+    over on the 5h window only, with that window resetting within PIN_GRACE, it is kept until
+    PIN_CEILING, because the quota is about to come back. Rotating it away instead only for
+    rebalance to bring it back after the 5h reset was the commonest swap there was. A spent
+    credential, a weekly overrun, or a reset further off moves it as before.
     """
     if usable(r):
         return False, ""
@@ -1444,20 +1454,22 @@ def needs_rotate(r: dict[str, object], pinned: bool,
         # pinned credential it also throws away a person's choice; the next refresh decides.
         return False, f"no reading this refresh ({r['err']}) — kept until the next one"
     why = over_limits(r)
-    if not pinned or not pin_holds(r):
+    tag = " — pinned" if pinned else ""
+    if not pin_holds(r):
         return True, why
     if p5 is None or p7 is None:
-        return True, f"{why} — pinned, but a window could not be read"
+        return True, f"{why}{tag}, but a window could not be read" if pinned else why
     if p7 >= LIMIT_7D:
-        return True, f"{why} — pinned, but the weekly window is past its limit"
+        return True, f"{why}{tag}, but the weekly window is past its limit" if pinned else why
     reset = ureset(r, "r5h")
     left = None if reset is None else reset - (time.time() if now is None else now)
     if left is None or left > PIN_GRACE:
-        return True, f"{why} — pinned, but its 5h window does not reset within {span(PIN_GRACE)}"
+        return True, (f"{why}{tag}, but its 5h window does not reset within {span(PIN_GRACE)}"
+                      if pinned else why)
     if p5 >= PIN_CEILING:
-        return True, f"{why} — pinned, and now at {p5:.0f}% (ceiling {PIN_CEILING:.0f}%)"
-    return False, (f"pinned and its 5h window resets in {max(0.0, left) / 60:.0f}m — "
-                   f"held until {PIN_CEILING:.0f}%")
+        return True, f"{why}{tag}, and now at {p5:.0f}% (ceiling {PIN_CEILING:.0f}%)"
+    return False, (f"{'pinned and its' if pinned else 'its'} 5h window resets in "
+                   f"{max(0.0, left) / 60:.0f}m — held until {PIN_CEILING:.0f}%")
 
 
 def load_holidays(path: str | None = None) -> set[str]:
@@ -1468,13 +1480,13 @@ def load_holidays(path: str | None = None) -> set[str]:
     """
     out: set[str] = set()
     try:
-        with open(path or HOLIDAYS_PATH, encoding="utf-8") as fh:
+        with open(path or HOLIDAYS_PATH, encoding="utf-8-sig") as fh:
             for line in fh:
-                words = line.split("#", 1)[0].split()
-                if not words:
+                m = re.match(r"\s*(\d{4}-\d{2}-\d{2})(?=[\s,;]|$)", line.split("#", 1)[0])
+                if not m:
                     continue
                 try:
-                    out.add(datetime.date.fromisoformat(words[0]).isoformat())
+                    out.add(datetime.date.fromisoformat(m.group(1)).isoformat())
                 except ValueError:
                     continue
     except OSError:
@@ -1496,7 +1508,21 @@ def day_off(when: float, holidays: set[str], night_from: float | None = None,
     if t.weekday() >= 5 or t.date().isoformat() in holidays:
         return True
     h = t.hour + t.minute / 60
-    return h >= night_from or h < night_until
+    if night_from == night_until:
+        return False                                  # no nights at all
+    if night_from > night_until:                      # the usual case: across midnight
+        return h >= night_from or h < night_until
+    return night_from <= h < night_until              # a night that starts after midnight
+
+
+def off_ends(now: float) -> float:
+    """When the current off hours end (now, if it is working time). Stepped in 5 minutes, up to 5 days."""
+    t = now
+    for _ in range(5 * 24 * 12):
+        if not day_off(t, load_holidays()):
+            return t
+        t += 300
+    return t
 
 
 def span(sec: float) -> str:
@@ -1507,7 +1533,7 @@ def span(sec: float) -> str:
 
 
 def track_still(still: dict, results: dict, now: float, max_gap: float | None = None,
-                unseen_idle: float | None = None) -> None:
+                unseen_idle: float | None = None, live: str = "") -> None:
     """Remember since when each credential's 5h and 7d readings have not moved.
 
     `still[token]` is ((5h, 7d), since, last seen). A rise restarts the clock — somebody is using
@@ -1519,6 +1545,10 @@ def track_still(still: dict, results: dict, now: float, max_gap: float | None = 
     Time nobody watched does not count: when the last good reading is more than `max_gap` old
     (a laptop asleep, probes failing for hours), equal readings either side of the gap prove
     nothing — a 5h window can roll over in between — so the clock restarts.
+
+    `live` is the credential this machine was using: its readings rise from our own use, which is
+    not somebody else's, so they never restart its clock — a credential just left is idle as far
+    as anyone else is concerned.
 
     `unseen_idle` gives a credential with no watched history (first sighting, or after such a
     gap) the benefit of the doubt: its clock starts that many seconds in the past, so it counts
@@ -1533,10 +1563,17 @@ def track_still(still: dict, results: dict, now: float, max_gap: float | None = 
         gap = prev is not None and max_gap is not None and len(prev) > 2 and now - prev[2] > max_gap
         # The 5h window falling while the week stands still is that window resetting, not anyone
         # using it; use after it shows up as a rise.
-        reset5 = prev is not None and cur[1] == prev[0][1] and cur[0] < prev[0][0]
-        if prev is None or gap:
+        reset5 = (prev is not None and cur[1] == prev[0][1] and cur[0] < prev[0][0]
+                  and cur[0] <= 1)                    # a reset reads ~0; a smaller drop is not one
+        moved = prev is not None and prev[0] != cur and not reset5 and tok != live
+        if prev is None:
             still[tok] = (cur, fresh, now)
-        elif prev[0] != cur and not reset5:
+        elif gap:
+            # Readings that moved across the gap are use: the clock restarts now. Unchanged ones
+            # say nothing either way, so the clock keeps whichever start is later — its own, or
+            # the benefit of the doubt — and never hands idle time to one seen in use.
+            still[tok] = (cur, now if moved else max(fresh, prev[1]), now)
+        elif moved:
             still[tok] = (cur, now, now)
         else:
             still[tok] = (cur, prev[1], now)
@@ -1653,6 +1690,7 @@ def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
     it would trade a busy credential for a dead one.
     """
     cands: list[tuple[float, dict[str, str]]] = []
+    roomy: list[tuple[float, dict[str, str]]] = []
     for row in rows:
         tok = store.token(row)
         if not tok or tok == exclude:
@@ -1663,6 +1701,12 @@ def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
         p = worst_window(r)
         if p is not None:
             cands.append((p, row))
+            p5, p7 = upct(r, "u5h"), upct(r, "u7d")
+            if p5 is not None and p7 is not None and p5 <= LIMIT_5H - 1 - MIN_HEADROOM \
+                    and p7 <= LIMIT_7D - 1 - MIN_HEADROOM:
+                roomy.append((p, row))
+    if strict and roomy:
+        cands = roomy                       # room to spare first; a tight one only if that is all
     if not cands:
         return None
     if strict:
@@ -3138,6 +3182,8 @@ CONFIG: tuple[tuple[str, object, object], ...] = (
     ("CTR_NIGHT_UNTIL", "float", NIGHT_UNTIL),
     ("CTR_BURN_UNSEEN", "bool", True),
     ("CTR_REBALANCE", "bool", True),
+    ("CTR_REBALANCE_IDLE", "float", REBALANCE_IDLE / 60),
+    ("CTR_MIN_HEADROOM", "float", MIN_HEADROOM),
     ("CTR_ENV_WRITE", "bool", True),
     ("CTR_CREDS_WRITE", "bool", True),
     ("CTR_EXPORT_ENV", "bool", False),
@@ -3322,8 +3368,8 @@ def main() -> int:
                     help="weekly resets this close count as a tie, and the 5h reset decides · "
                          "CTR_RESET_TIE (default %(default)s)")
     ap.add_argument("--pin-grace", type=finite, metavar="MIN",
-                    help="a pinned credential over its 5h limit is kept when that window resets "
-                         "within this · CTR_PIN_GRACE (default %(default)s)")
+                    help="the live credential (pinned or not) over its 5h limit is kept when that "
+                         "window resets within this · CTR_PIN_GRACE (default %(default)s)")
     ap.add_argument("--pin-ceiling", type=finite, metavar="PCT",
                     help="…but only until its 5h window reaches this · CTR_PIN_CEILING "
                          "(default %(default)s)")
@@ -3348,6 +3394,12 @@ def main() -> int:
                     help="move to a usable credential whose week resets sooner (by more than "
                          "CTR_RESET_TIE) even while the live one is fine · CTR_REBALANCE "
                          "(default %(default)s)")
+    ap.add_argument("--rebalance-idle", type=finite, metavar="MIN",
+                    help="rebalance skips a credential whose readings moved this recently — "
+                         "somebody is on it · CTR_REBALANCE_IDLE (default %(default)s)")
+    ap.add_argument("--min-headroom", type=finite, metavar="PCT",
+                    help="a replacement needs this many points left below each limit, if any "
+                         "credential has them · CTR_MIN_HEADROOM (default %(default)s)")
     ap.add_argument("--night-from", type=finite, metavar="HOUR",
                     help="every night from this hour counts as off hours for the spend-down "
                          "(24 = no nights) · CTR_NIGHT_FROM (default %(default)s)")
@@ -3361,7 +3413,7 @@ def main() -> int:
                     help="Claude Code credentials file kept in step with the shell file · "
                          "CTR_CREDS_FILE (default %(default)s)")
     ap.add_argument("--env-write", action=B,
-                    help="write the shell file; without it the t/T/z keys are read-only · "
+                    help="write the shell file; without it the p/T/z keys are read-only · "
                          "CTR_ENV_WRITE (default %(default)s)")
     ap.add_argument("--creds-write", action=B,
                     help="write the credentials file; without it the shell file is the only way "
@@ -3381,7 +3433,7 @@ def main() -> int:
     ap.set_defaults(**cfg)
     args = ap.parse_args()
     global ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING, BURN_WINDOW, BURN_IDLE, BURN_MIN
-    global HOLIDAYS_PATH, NIGHT_FROM, NIGHT_UNTIL
+    global HOLIDAYS_PATH, NIGHT_FROM, NIGHT_UNTIL, REBALANCE_IDLE, MIN_HEADROOM
     ROTATE_GAP = max(0.0, args.rotate_gap)
     RESET_TIE = max(0.0, args.reset_tie) * 60
     PIN_GRACE = max(0.0, args.pin_grace) * 60
@@ -3389,6 +3441,8 @@ def main() -> int:
     BURN_WINDOW = max(1.0, args.burn_window) * 60
     BURN_IDLE = max(0.0, args.burn_idle) * 60
     BURN_MIN = max(0.0, args.burn_min) * 60
+    REBALANCE_IDLE = max(0.0, args.rebalance_idle) * 60
+    MIN_HEADROOM = max(0.0, min(100.0, args.min_headroom))
     NIGHT_FROM = max(0.0, min(24.0, args.night_from))
     NIGHT_UNTIL = max(0.0, min(24.0, args.night_until))
     for k in ("csv", "holidays", "log", "env_file", "creds_file"):
@@ -3430,7 +3484,7 @@ def main() -> int:
     env_path = os.path.expanduser(args.env_file)
     # One dashboard per machine writes; a second one watches. A snapshot or a diagnosis writes
     # nothing, so it neither takes the lock nor needs it.
-    lock = True if (args.once or args.diagnose) else take_lock(STATE_PATH + ".lock")
+    lock = None if (args.once or args.diagnose) else take_lock(STATE_PATH + ".lock")
     env_ok = args.env_write and lock is not None
     creds_path = os.path.expanduser(args.creds_file)
     # macOS keeps the login in the Keychain, so a file there is not what Claude Code reads.
@@ -3446,7 +3500,7 @@ def main() -> int:
     if auto_rotate not in ROTATE_MODES:
         auto_rotate = "off"
     last_rotate, no_cand_said = 0.0, False
-    notify_ok, warned_tok = args.notify, ""
+    notify_ok, warned = args.notify, set()
     # A hand-injected credential is a decision, and auto-rotate does not get to reverse it. The
     # pin outlives a restart because the decision does.
     _st0 = load_state()
@@ -3457,12 +3511,22 @@ def main() -> int:
     burn_on = args.burn
     #: Since when each credential's readings have stood still: ((5h, 7d), since).
     still: dict[str, tuple[tuple[float, float], float, float]] = {}
-    # The clock survives a restart: a credential seen moving just before it still waits, one seen
-    # standing still keeps its time. Stored by digest, like the pin.
+    # The clock survives a restart: a credential seen moving still waits, one seen standing still
+    # keeps its time. Stored by digest, like the pin.
     _by_id = {pin_id(store.token(r)): store.token(r) for r in store.rows}
     for _id, v in (_st0.get("still") or {}).items() if isinstance(_st0.get("still"), dict) else ():
-        if _id in _by_id and isinstance(v, list) and len(v) == 4:
-            still[_by_id[_id]] = ((float(v[0]), float(v[1])), float(v[2]), float(v[3]))
+        try:
+            f = [float(x) for x in v] if isinstance(v, list) and len(v) == 4 else []
+        except (TypeError, ValueError):
+            continue                                   # a damaged entry is dropped, not fatal
+        if _id in _by_id and f and all(math.isfinite(x) for x in f):
+            still[_by_id[_id]] = ((f[0], f[1]), f[2], f[3])
+    # The first gap check after a start uses the smaller of this run's interval and the last
+    # one's: a longer --interval now must not count the downtime as watched time.
+    _prev_iv = _st0.get("still_interval")
+    first_iv = min(float(_prev_iv), float(args.interval)) \
+        if isinstance(_prev_iv, (int, float)) and math.isfinite(_prev_iv) and _prev_iv > 0 \
+        else float(args.interval)
     if pinned and _st0.get("pinned") != pinned:  # an older file held the raw token: drop it now
         _st0["pinned"] = pinned
         save_state(_st0)
@@ -3542,19 +3606,36 @@ def main() -> int:
         refresh_pool(args.timeout)         # free, and it keeps the dollar figures exact
         record(results)
         # Two missed refreshes (plus slack for a slow probe) is a gap nobody watched.
-        track_still(still, results, time.time(), max_gap=2 * interval + args.timeout + 30,
-                    unseen_idle=BURN_IDLE if args.burn_unseen else None)
-        if lock is not None:                   # only the dashboard that writes keeps the record
+        nonlocal first_iv
+        iv = min(interval, first_iv) if first_iv else interval
+        first_iv = 0.0
+        track_still(still, results, time.time(), max_gap=2 * iv + args.timeout + 30,
+                    unseen_idle=BURN_IDLE if args.burn_unseen else None,
+                    live=str(LIVE.get("token") or "") if LIVE.get("active") else "")
+        if lock is not None and not args.once:  # only the dashboard that writes keeps the record
+            # Merged, not replaced: a run that sees part of the list (--only) must not erase the
+            # clocks of the credentials it cannot see. Entries unseen for a day are pruned.
             _st = load_state()
-            _st["still"] = {pin_id(t): [v[0][0], v[0][1], v[1], v[2]] for t, v in still.items()}
+            old = _st.get("still") if isinstance(_st.get("still"), dict) else {}
+            mine = {pin_id(t): [v[0][0], v[0][1], v[1], v[2]] for t, v in still.items()}
+            now_ = time.time()
+            keep_ = {k: v for k, v in old.items() if k not in mine and isinstance(v, list)
+                     and len(v) == 4 and isinstance(v[3], (int, float))
+                     and now_ - v[3] < 86400}
+            _st["still"] = {**keep_, **mine}
+            _st["still_interval"] = interval
             save_state(_st)
         read_live()                        # someone may have edited the shell file behind us
         if args.log:
             log_readings(args.log, store, store.rows, results)
         return results
 
-    def warn_if_in_use(results: dict) -> str:
-        """Say something, once, when the live credential crosses the line while still in use.
+    def warn_if_in_use(results: dict, tok: str) -> str:
+        """Say something, once, when a credential crosses the line while sessions here still use it.
+
+        Called after auto-rotate has decided, for the live credential and the one it replaced in
+        the same refresh — so a credential just kept on purpose is not warned about, and sessions
+        left on the one rotated away from (they carry it in their environment) are.
 
         Gated on a session actually holding the token ON THIS MACHINE. A warning about a
         credential nothing is running against is noise — rotating away from it costs nobody
@@ -3567,8 +3648,7 @@ def main() -> int:
         and a signal would discard whatever the turn had in flight. Telling the person is both the
         safest option and the only one that lets them finish the turn first.
         """
-        nonlocal warned_tok
-        tok, name = str(LIVE.get("token") or ""), LIVE.get("name")
+        name = token_name(store, tok) if tok else None
         if not tok or not name:
             return ""
         if burning and burning[0] == pin_id(tok):
@@ -3576,14 +3656,14 @@ def main() -> int:
         cur = results.get(tok, {})
         p = worst_window(cur)
         if p is None or usable(cur):
-            warned_tok = ""                    # back under the line: re-arm for the next crossing
+            warned.discard(tok)                # back under the line: re-arm for the next crossing
             return ""
-        if warned_tok == tok:
+        if tok in warned:
             return ""
         busy = sessions_on(tok)
         if not busy:
             return ""
-        warned_tok = tok
+        warned.add(tok)
         which = over_limits(cur)
         plural = "s" if len(busy) > 1 else ""
         line = (f"{name} is at {p:.0f}% of its {which} window and {len(busy)} "
@@ -3632,6 +3712,23 @@ def main() -> int:
         _st = load_state()
         pinned = pin_id(str(_st.get("pinned") or ""))
         burning = burn_record(_st, now)
+        if pinned and pinned == pin_id(tok) and lock is not None:
+            # A pin is a choice for this week: it lifts when the pinned credential's week resets,
+            # so rebalance and the spend-down are not off for good after one `p`.
+            until_p = _st.get("pinned_until")
+            if not isinstance(until_p, (int, float)):
+                r7 = ureset(cur, "r7d")
+                if r7 is not None:
+                    _st["pinned_until"] = r7
+                    save_state(_st)
+            elif now >= until_p:
+                _st.pop("pinned", None)
+                _st.pop("pinned_until", None)
+                save_state(_st)
+                return f"pin on {LIVE.get('name')} lifted — its week reset"
+        if burning is None and "burn" in _st and lock is not None:
+            _st.pop("burn", None)              # one whose reset has passed: drop the record
+            save_state(_st)
         off = day_off(now, load_holidays())
         # Not while Claude Code is on the /login: nothing would be spent, and `z` back would
         # land on a credential past its limits.
@@ -3693,7 +3790,10 @@ def main() -> int:
                 spend(tok, mine)
                 return (f"↺ burn: keeping {LIVE.get('name')} — {keep}; limits waived until "
                         f"the reset")
-            if got:
+            # Never away from a live credential that is fine and whose own week ends first.
+            mine7 = ureset(cur, "r7d")
+            if got and not (usable(cur) and mine7 is not None
+                            and not got[2] < mine7 - RESET_TIE):
                 return switch(got, "")
         go, why = needs_rotate(cur, is_pinned)
         if not go:
@@ -3704,14 +3804,23 @@ def main() -> int:
             # reset comes more than RESET_TIE before the live one's takes over, even though the
             # live one is fine — what it has left is lost sooner. Only with `on` (park would
             # switch a working session off) and never over a pin.
+            # Not while sessions here carry the live token in their environment (they could not
+            # follow, and nothing would warn them later), not on a refresh where a reading is
+            # missing (the true best may be hidden behind it), and not onto a week with minutes
+            # left.
+            blind = any(r.get("err") and upct(r, "u5h") is None and not refused(r)
+                        for r in results.values())
             if (args.rebalance and auto_rotate == "on" and not is_pinned and gap_ok
-                    and LIVE.get("active") and not why):
-                pick = rotate_pick(store, rows, results, exclude=tok, strict=True)
+                    and LIVE.get("active") and not why and not blind and not sessions_on(tok)):
+                quiet = [r_ for r_ in rows
+                         if now - (still.get(store.token(r_)) or (None, now))[1] >= REBALANCE_IDLE]
+                pick = rotate_pick(store, quiet, results, exclude=tok, strict=True)
                 if pick is not None:
                     row, p = pick
                     theirs = ureset(results.get(store.token(row), {}), "r7d")
                     mine = ureset(cur, "r7d")
-                    if theirs is not None and (mine is None or theirs < mine - RESET_TIE):
+                    if theirs is not None and mine is not None and theirs - now >= BURN_MIN \
+                            and theirs < mine - RESET_TIE:
                         old = LIVE.get("name")
                         try:
                             msg = go_live(store.token(row), None)
@@ -3828,6 +3937,10 @@ def main() -> int:
                     swept = True
                     probes += len(store.rows)
                     last, due = time.time(), time.time() + interval
+                    if burning:
+                        # A hold ends at its reset or when off hours do; with a long interval the
+                        # next sweep must not wait past either.
+                        due = min(due, burning[1] + 5, off_ends(time.time()) + 5)
                     if new_events:
                         flash = new_events[-1]
                     if args.alert is not None:
@@ -3845,7 +3958,11 @@ def main() -> int:
 
                 rows = sort_rows(store, store.rows, results, sort, desc)
                 if swept:
-                    for msg in (warn_if_in_use(results), auto_swap(results, rows)):
+                    was = str(LIVE.get("token") or "")
+                    swap = auto_swap(results, rows)
+                    now_live = str(LIVE.get("token") or "")
+                    warns = [warn_if_in_use(results, t) for t in dict.fromkeys((now_live, was)) if t]
+                    for msg in (*warns, swap):
                         if msg:
                             flash = msg
                             events.append(msg)
@@ -3963,10 +4080,11 @@ def main() -> int:
                             "no clipboard mechanism available"
                 elif key in ("p", "t"):                # p pins; t is the old key for it
                     if not env_ok:
-                        flash = "--no-env-write: the shell file is read-only"
+                        flash = ("another dashboard writes here — this one only watches"
+                                 if lock is None else "--no-env-write: the shell file is read-only")
                         continue
                     ans = ask(keys, f"\n  pin — row number (1-{len(rows)}), blank for the "
-                                    f"most 5h headroom, 'c' to cancel: ")
+                                    f"freshest, 'c' to cancel: ")
                     if ans.lower().startswith("c"):
                         flash = "pin cancelled"
                         continue
@@ -4001,6 +4119,11 @@ def main() -> int:
                     pinned = pin_id(store.token(row))  # a hand-made choice auto-rotate respects
                     _st = load_state()
                     _st["pinned"] = pinned
+                    r7p = ureset(results.get(store.token(row), {}), "r7d")
+                    if r7p is not None:
+                        _st["pinned_until"] = r7p    # lifts when this credential's week resets
+                    else:
+                        _st.pop("pinned_until", None)
                     _st.pop("burn", None)
                     save_state(_st)
                     flash = f"pinned '{store.name(row)}' live — {msg}"
@@ -4018,6 +4141,9 @@ def main() -> int:
                         flash += " · " + (daemon_stop() if stop.lower().startswith("y")
                                           else "restart Claude Code clients to pick it up")
                 elif key == "T":
+                    if lock is None:
+                        flash = "another dashboard runs auto-rotate here — press T there"
+                        continue
                     auto_rotate = ROTATE_MODES[
                         (ROTATE_MODES.index(auto_rotate) + 1) % len(ROTATE_MODES)]
                     st = load_state()
@@ -4039,8 +4165,12 @@ def main() -> int:
                 elif key == "u":
                     # A pin outlives the moment it was made for: it keeps auto-rotate's hands off
                     # the credential, and keeps the spend-down rule from starting, until lifted.
+                    if lock is None:
+                        flash = "another dashboard owns the pin — press u there"
+                        continue
                     _st = load_state()
                     had = _st.pop("pinned", None)
+                    _st.pop("pinned_until", None)
                     pinned = ""
                     if had:
                         save_state(_st)
@@ -4050,7 +4180,8 @@ def main() -> int:
                              f"rule may move it now" if had else "nothing is pinned")
                 elif key == "z":
                     if not env_ok:
-                        flash = "--no-env-write: the shell file is read-only"
+                        flash = ("another dashboard writes here — this one only watches"
+                                 if lock is None else "--no-env-write: the shell file is read-only")
                         continue
                     try:
                         msg, _on = toggle_live(env_path, creds_path, store, file_mode, creds_ok)
@@ -4159,7 +4290,7 @@ def main() -> int:
                         # dropped and reseeded from the probe just taken.
                         for cache in (results, hist, marks, USAGE_OK, still):
                             cache.pop(old_tok, None)
-                        if pinned and pinned == pin_id(old_tok):
+                        if pinned and pinned == pin_id(old_tok) and lock is not None:
                             # The pin is a choice of this row, not of a string: it follows the
                             # row to its new token instead of silently lapsing.
                             pinned = pin_id(new_tok)
