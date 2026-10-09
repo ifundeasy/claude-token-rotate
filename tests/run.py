@@ -11,6 +11,7 @@ Shell behaviour is checked by actually running zsh with a value already in the e
 is the only way to catch the failure this suite exists for: commenting an `export` out looks
 correct in the file and does nothing to a shell that inherited the variable from its parent.
 """
+import datetime
 import json
 import os
 import re
@@ -677,6 +678,518 @@ def test_header_sort(d: str) -> None:
           frame.split("\n")[-1] == "")
 
 
+def test_burn_before_weekly_reset(d: str) -> None:
+    """On a day off, weekly quota about to reset unused is spent rather than lost.
+
+    Each condition guards something different, so each is checked failing on its own: a working
+    day leaves rotation alone; a credential in use here, or whose readings moved within BURN_IDLE,
+    belongs to somebody; a refused or 100% credential has nothing left; a reset BURN_WINDOW away or
+    further still leaves time for ordinary use. The 5h and 7d LIMITS are ignored on purpose —
+    the quota past them is exactly what would otherwise be lost.
+    """
+    now = 1_800_000_000.0
+    H = 3600
+
+    def wk(p5: float, p7: float, reset_in: float) -> dict[str, object]:
+        return {**reading(p5, p7), "r7d": str(now + reset_in)}
+
+    def why(r: dict[str, object], **kw: object) -> str:
+        args = {"now": now, "still_since": now - m.BURN_IDLE, "on_machine": False, "off": True}
+        return m.burn_reason(r, **{**args, **kw})
+
+    hot = wk(90, 95, 1.5 * H)                    # past both limits, weekly resets in 1h30m
+    check("burn: 5h 90% / 7d 95% still burns — the limits are not consulted", why(hot) != "")
+    check("burn: the reason names the reset and what is left",
+          "1h30m" in why(hot) and "5%" in why(hot))
+    check("burn: a reset just inside BURN_WINDOW burns", why(wk(10, 50, m.BURN_WINDOW - 60)) != "")
+    check("burn: a reset exactly BURN_WINDOW away does not (the window is strict)",
+          why(wk(10, 50, m.BURN_WINDOW)) == "")
+    check("burn: stillness of exactly BURN_IDLE is enough", why(hot, still_since=now - m.BURN_IDLE) != "")
+    # The shipped defaults themselves: a 7h window and 2h of stillness (.env.example documents them).
+    check("burn defaults: 7h window, 2h idle", m.BURN_WINDOW == 7 * H and m.BURN_IDLE == 2 * H)
+    check("burn defaults: a reset 6h59m away after 2h of stillness burns",
+          m.burn_reason(wk(10, 50, 6 * H + 59 * 60), now=now, still_since=now - 2 * H,
+                        on_machine=False, off=True) != "")
+    check("burn defaults: 1h59m of stillness does not",
+          m.burn_reason(wk(10, 50, 6 * H + 59 * 60), now=now, still_since=now - (H + 59 * 60),
+                        on_machine=False, off=True) == "")
+    check("burn: not on a working day", why(hot, off=False) == "")
+    check("burn: not while a session here holds it", why(hot, on_machine=True) == "")
+    check("burn: not when its readings moved within BURN_IDLE",
+          why(hot, still_since=now - m.BURN_IDLE + 60) == "")
+    check("burn: not when it was never observed", why(hot, still_since=None) == "")
+    check("burn: not when the reset is further than BURN_WINDOW",
+          why(wk(90, 95, m.BURN_WINDOW + 60)) == "")
+    check("burn: not when the reset has already passed", why(wk(90, 95, -60)) == "")
+    check("burn: not at the very instant of the reset", why(wk(90, 95, 0)) == "")
+    check("burn: not with the weekly window at 100%", why(wk(10, 100, H)) == "")
+    rej7 = {**wk(20, 90, H), "s7d": "rejected", "ok": False, "code": 429}
+    rej5 = {**wk(100, 40, H), "s5h": "rejected", "ok": False, "code": 429}
+    check("burn: not when the weekly window is refused", why(rej7) == "")
+    check("burn: not when the 5h window is refused", why(rej5) == "")
+    check("burn: not when unauthorized", why({**wk(10, 10, H), "err": "unauthorized"}) == "")
+    check("burn: not when no weekly reset is known", why(reading(90, 95)) == "")
+    check("burn: window and idle can be overridden",
+          why(hot, window=H) == "" and why(hot, idle=2 * m.BURN_IDLE) == ""
+          and why(wk(10, 50, m.BURN_WINDOW + H), window=m.BURN_WINDOW + 2 * H) != "")
+
+    until = now + 1.5 * H
+    check("burn holds: before the weekly reset", m.burn_holds(hot, until, now))
+    check("burn holds: lifts at the reset", not m.burn_holds(hot, until, until))
+    check("burn holds: lifts after the reset", not m.burn_holds(hot, until, until + 60))
+    check("burn holds: lifts when refused",
+          not m.burn_holds(rej7, until, now) and not m.burn_holds(rej5, until, now))
+
+    # burn_pick: soon wins; live, held and busy would each have beaten it but are not eligible.
+    store = store_with(d, live=tok("L"), late=tok("A"), soon=tok("S"), held=tok("E"), busy=tok("B"))
+    res = {tok("L"): wk(90, 95, 0.5 * H), tok("A"): wk(10, 20, 1.8 * H),
+           tok("S"): wk(90, 95, 1 * H), tok("E"): wk(50, 50, 0.6 * H),
+           tok("B"): wk(10, 20, 0.2 * H)}
+    still: dict = {}
+    m.track_still(still, res, now - m.BURN_IDLE)          # all unmoved for BURN_IDLE...
+    res[tok("B")] = wk(15, 20, 0.2 * H)
+    m.track_still(still, res, now - 60)                    # ...except busy, used a minute ago
+    asked: list[str] = []
+
+    def held(t: str) -> bool:
+        asked.append(t)
+        return t == tok("E")
+
+    def pick(live_tok: str = tok("L"), holders=held, off: bool = True):
+        return m.burn_pick(store, store.rows, res, now=now, still=still, live_tok=live_tok,
+                           holders=holders, off=off)
+
+    got = pick()
+    check("burn pick: the soonest eligible weekly reset", got is not None and store.name(got[0]) == "soon")
+    check("burn pick: returns its reason and weekly reset",
+          got is not None and got[1] != "" and got[2] == now + H)
+    check("burn pick: a session is only looked for on an otherwise eligible credential",
+          tok("B") not in asked and tok("L") not in asked)
+    check("burn pick: the live token is skipped (it would win otherwise)",
+          store.name(pick(live_tok="")[0]) == "live")
+    check("burn pick: a token a session holds is skipped (it would win otherwise)",
+          store.name(pick(holders=lambda t: False)[0]) == "held")
+    check("burn pick: nothing on a working day", pick(off=False) is None)
+
+    still = {}
+    m.track_still(still, {tok("A"): reading(10, 20)}, 100.0)
+    since = (lambda: still[tok("A")][1])
+    check("still: first sighting starts the clock now", since() == 100.0)
+    m.track_still(still, {tok("A"): reading(10, 20)}, 200.0)
+    check("still: unchanged readings keep the clock", since() == 100.0)
+    m.track_still(still, {tok("A"): reading(11, 20)}, 300.0)
+    check("still: a 5h rise restarts it", since() == 300.0)
+    m.track_still(still, {tok("A"): reading(11, 21)}, 400.0)
+    check("still: a weekly-only rise restarts it", since() == 400.0)
+    m.track_still(still, {tok("A"): reading(0, 21)}, 500.0)
+    check("still: a 5h fall with the week unchanged (a 5h reset) is not use", since() == 400.0)
+    m.track_still(still, {tok("A"): reading(0, 2)}, 550.0)
+    check("still: a weekly fall (a weekly reset) restarts it", since() == 550.0)
+    m.track_still(still, {tok("A"): {"err": "unauthorized"}, tok("B"): {"u5h": "0.10"}}, 600.0)
+    check("still: a failed probe leaves the entry alone", since() == 550.0)
+    check("still: a failed probe does not start a new entry", tok("B") not in still)
+    m.track_still(still, {tok("A"): reading(0, 2)}, 700.0)
+    check("still: the same readings after a failed probe keep the clock", since() == 550.0)
+
+    path = os.path.join(d, "holidays.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# Indonesian national holidays\n"
+                 "2026-08-17 Hari Kemerdekaan\n"
+                 "2026-12-25   Natal   # Christmas\n"
+                 "\n"
+                 "   2026-03-20 Idul Fitri\n"
+                 "2026-05-01#Hari Buruh\n"
+                 "# 2026-01-01 commented out\n"
+                 "not-a-date Something\n"
+                 "2026-13-01 no such month\n"
+                 "2026-02-30\n")
+    hol = m.load_holidays(path)
+    check("holidays: dates parsed, names, comments, blank and bad lines skipped",
+          hol == {"2026-08-17", "2026-12-25", "2026-03-20", "2026-05-01"})
+    check("holidays: a missing file means none", m.load_holidays(os.path.join(d, "nope.txt")) == set())
+
+    noon = (lambda y, mo, dd: datetime.datetime(y, mo, dd, 12).timestamp())
+    check("day off: a Saturday", m.day_off(noon(2026, 10, 10), set()))
+    check("day off: a Sunday", m.day_off(noon(2026, 10, 11), set()))
+    check("day off: not a plain Wednesday", not m.day_off(noon(2026, 10, 14), set()))
+    check("day off: a Monday listed as a holiday", m.day_off(noon(2026, 8, 17), hol))
+    check("day off: that Monday without the list", not m.day_off(noon(2026, 8, 17), set()))
+
+    check("span: hours and minutes", m.span(6000) == "1h40m" and m.span(3600) == "1h00m")
+    check("span: minutes alone", m.span(1500) == "25m" and m.span(-5) == "0m")
+
+
+def test_holiday_file(d: str) -> None:
+    """The shipped holidays.txt parses whole, and it holds libur nasional only.
+
+    The list was copied from the SKB 3 Menteri for 2026 and 2027. Cuti bersama is excluded on
+    purpose, so a few of those dates are checked to stay out.
+    """
+    days = m.load_holidays(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
+        __file__))), "holidays.txt"))
+    check("holidays.txt: 17 dates for 2026", sum(x.startswith("2026") for x in days) == 17)
+    check("holidays.txt: 18 dates for 2027", sum(x.startswith("2027") for x in days) == 18)
+    check("holidays.txt: Proklamasi and Christmas are in",
+          {"2026-08-17", "2026-12-25", "2027-08-17", "2027-12-25"} <= days)
+    check("holidays.txt: cuti bersama is not",
+          not days & {"2026-02-16", "2026-03-20", "2026-12-24", "2027-03-09", "2027-12-24"})
+
+
+def test_config(d: str) -> None:
+    """Every setting comes from one table: its default, then .env, then CTR_* in the environment.
+
+    A typo must fail loudly instead of silently doing nothing, so an unknown CTR_ key or a value
+    that cannot be used is an error. And .env.example must state the real defaults: copying it to
+    .env as the README says must change nothing at all.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    nowhere = os.path.join(d, "no-such.env")
+    default = {k: v for k, _, v in m.CONFIG}
+
+    def at(body: str, name: str = "cfg.env") -> str:
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return path
+
+    def load(path: str, env: dict[str, str] | None = None) -> dict[str, object]:
+        """load_config, or {"error": message} for the ConfigError it raised."""
+        try:
+            return m.load_config(path, environ={} if env is None else env)
+        except m.ConfigError as exc:
+            return {"error": str(exc)}
+
+    # --- read_env_file
+    got = m.read_env_file(at("# a comment on its own line\n"
+                             "   # an indented one\n"
+                             "\n"
+                             "PLAIN=value\n"
+                             "INLINE=value # trailing comment\n"
+                             "GLUED=a#b\n"
+                             'DQ="double # kept"\n'
+                             "SQ='single # kept'\n"
+                             "export EXPORTED=v\n"
+                             "  SPACED   =   spaced value  \n"
+                             "\n"
+                             "EMPTY=\n", "parse.env"))
+    check("env file: comments and blank lines are skipped",
+          set(got) == {"PLAIN", "INLINE", "GLUED", "DQ", "SQ", "EXPORTED", "SPACED", "EMPTY"})
+    check("env file: a plain value", got.get("PLAIN") == "value")
+    check("env file: ` # comment` after an unquoted value is dropped", got.get("INLINE") == "value")
+    check("env file: a `#` with no space before it is part of the value", got.get("GLUED") == "a#b")
+    check("env file: double quotes stripped, the `#` inside kept", got.get("DQ") == "double # kept")
+    check("env file: single quotes stripped, the `#` inside kept", got.get("SQ") == "single # kept")
+    check("env file: a leading `export ` is allowed", got.get("EXPORTED") == "v")
+    check("env file: spaces around `=` and the value are ignored", got.get("SPACED") == "spaced value")
+    check("env file: an empty value is empty", got.get("EMPTY") == "")
+    check("env file: a missing file is an empty one", m.read_env_file(nowhere) == {})
+    try:
+        m.read_env_file(at("GOOD=1\nNO_EQUALS_SIGN\n", "bad.env"))
+        check("env file: a line without `=` is refused, naming file and line", False)
+    except m.ConfigError as exc:
+        check("env file: a line without `=` is refused, naming file and line", "bad.env:2" in str(exc))
+
+    # --- load_config: precedence and defaults
+    base = load(nowhere)
+    check("config: no .env and no CTR_* still loads", "error" not in base)
+    check("config: every setting appears, keyed by its argparse dest",
+          set(base) == {k[len("CTR_"):].lower() for k in default})
+    check("config: every non-path setting has its default",
+          all(base.get(k[len("CTR_"):].lower()) == v for k, kind, v in m.CONFIG if kind != "path"))
+    check("config: path defaults resolve beside the binary, `~` expanded, empty stays empty",
+          base.get("csv") == os.path.join(m.app_dir(), "token.csv")
+          and base.get("holidays") == os.path.join(m.app_dir(), "holidays.txt")
+          and base.get("env_file") == os.path.expanduser("~/.zshenv")
+          and base.get("creds_file") == m.LOCAL_CREDS and base.get("log") == "")
+
+    f = at("CTR_LIMIT_7D=70\nCTR_LIMIT_5H=50\nCTR_INTERVAL=\n")
+    cfg = load(f)
+    check("config: .env overrides the default", cfg.get("limit_7d") == 70.0 and cfg.get("limit_5h") == 50.0)
+    check("config: an empty value in .env means the default", cfg.get("interval") == default["CTR_INTERVAL"])
+    cfg = load(f, {"CTR_LIMIT_7D": "80"})
+    check("config: CTR_* in the environment overrides .env",
+          cfg.get("limit_7d") == 80.0 and cfg.get("limit_5h") == 50.0)
+    check("config: an empty value in the environment means the default",
+          load(nowhere, {"CTR_TIMEOUT": ""}).get("timeout") == default["CTR_TIMEOUT"])
+    cfg = load(nowhere, {"HOME": "/nowhere", "PATH": "/bin", "LIMIT_7D": "1", "ctr_limit_7d": "5",
+                         "XCTR_BOGUS": "1"})
+    check("config: environment keys without CTR_ are ignored", cfg == base)
+
+    # --- load_config: kinds
+    cfg = load(at("CTR_INTERVAL=90\nCTR_TIMEOUT=2.5\nCTR_ALERT=80\n"))
+    check("config: an int setting parses to an int",
+          cfg.get("interval") == 90 and type(cfg.get("interval")) is int)
+    check("config: a float setting parses to a float",
+          cfg.get("timeout") == 2.5 and cfg.get("alert") == 80.0 and type(cfg.get("alert")) is float)
+    check("config: an optional float left empty is off", base.get("alert") is None)
+    spellings = (("true", True), ("TRUE", True), ("1", True), ("yes", True), ("Yes", True),
+                 ("on", True), ("ON", True), ("false", False), ("False", False), ("0", False),
+                 ("no", False), ("NO", False), ("off", False), ("Off", False))
+    check("config: booleans in .env, any case (true/false 1/0 yes/no on/off)",
+          all(load(at(f"CTR_COLOR={s}\n")).get("color") is want for s, want in spellings))
+    check("config: booleans in the environment too",
+          all(load(nowhere, {"CTR_BURN": s}).get("burn") is want for s, want in spellings))
+    cfg = load(at("CTR_VIEW=w\nCTR_SORT=r7d\nCTR_ROTATE_MODE=park\n"))
+    check("config: a value from a choice list is taken",
+          (cfg.get("view"), cfg.get("sort"), cfg.get("rotate_mode")) == ("w", "r7d", "park"))
+
+    # --- load_config: refusals
+    err = (lambda body, env=None: load(at(body) if body else nowhere, env).get("error", ""))
+    check("config: a bad boolean is refused, naming the key and the file",
+          "CTR_COLOR" in err("CTR_COLOR=maybe\n") and "cfg.env" in err("CTR_COLOR=maybe\n"))
+    check("config: a bad number is refused",
+          err("CTR_LIMIT_7D=seventy\n") != "" and err("CTR_ALERT=high\n") != "")
+    check("config: a fraction for an int setting is refused", err("CTR_INTERVAL=1.5\n") != "")
+    check("config: a value outside its choices is refused",
+          err("CTR_VIEW=x\n") != "" and err("CTR_SORT=bogus\n") != ""
+          and err("CTR_ROTATE_MODE=sometimes\n") != "")
+    check("config: an unknown CTR_ key in .env is refused",
+          "unknown setting CTR_BOGUS" in err("CTR_BOGUS=1\n"))
+    check("config: an unknown CTR_ key in the environment is refused, naming where",
+          "CTR_LIMIT_7DD" in err("", {"CTR_LIMIT_7DD": "70"})
+          and "the environment" in err("", {"CTR_LIMIT_7DD": "70"}))
+    check("config: a bad value in the environment is refused, naming where",
+          "the environment" in err("", {"CTR_INTERVAL": "abc"}))
+
+    # --- load_config: paths. Run from elsewhere, so "beside the binary" cannot mean the cwd.
+    here = os.getcwd()
+    os.chdir(d)
+    try:
+        cfg = load(at(f"CTR_CSV=sub/my.csv\nCTR_ENV_FILE=~/my-rc\nCTR_LOG={d}/log.csv\n"),
+                   {"CTR_HOLIDAYS": "days.txt"})
+    finally:
+        os.chdir(here)
+    check("config: a relative path resolves beside the binary, not the cwd",
+          cfg.get("csv") == os.path.join(m.app_dir(), "sub/my.csv")
+          and cfg.get("holidays") == os.path.join(m.app_dir(), "days.txt"))
+    check("config: `~` in a path is expanded", cfg.get("env_file") == os.path.expanduser("~/my-rc")
+          and "~" not in str(cfg.get("env_file")))
+    check("config: an absolute path is kept", cfg.get("log") == os.path.join(d, "log.csv"))
+
+    # --- .env.example documents exactly the real settings and defaults
+    example = os.path.join(repo, ".env.example")
+    keys = set(m.read_env_file(example))
+    missing, extra = sorted(set(default) - keys), sorted(keys - set(default))
+    check(".env.example: names every setting" + (f" (missing {', '.join(missing)})" if missing else ""),
+          not missing)
+    check(".env.example: names nothing that is not a setting"
+          + (f" (unknown {', '.join(extra)})" if extra else ""), not extra)
+    check(".env.example: its values are exactly the built-in defaults", load(example) == base)
+
+    # --- the flags take their defaults from the same table
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("CTR_")}
+
+    def run_help(**extra: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run([sys.executable, "main.py", "--help"], cwd=repo,
+                              env={**clean, **extra}, capture_output=True, text=True, timeout=60)
+
+    def flag_help(text: str, flag: str) -> str:
+        """The help paragraph of `flag`, whitespace collapsed so a wrapped line cannot hide it."""
+        flat = " ".join(text.split())
+        seg = flat[flat.rfind(flag):]                     # the last mention: past the usage line
+        end = seg.find(" --", 1)
+        return seg if end < 0 else seg[:end]
+
+    h = run_help()
+    check("--help: exits 0 and lists --burn-window and CTR_LIMIT_7D",
+          h.returncode == 0 and "--burn-window" in h.stdout and "CTR_LIMIT_7D" in h.stdout)
+    h = run_help(CTR_LIMIT_7D="70")
+    check("--help: CTR_LIMIT_7D=70 in the environment is --limit-7d's default",
+          h.returncode == 0 and "default 70.0" in flag_help(h.stdout, "--limit-7d"))
+    h = run_help(CTR_BOGUS="1")
+    check("--help: a broken config still shows help, and says what is wrong",
+          h.returncode == 0 and "unknown setting CTR_BOGUS" in h.stderr and "--burn" in h.stdout)
+
+    qc = os.path.join(d, "quoted-comment.env")
+    with open(qc, "w", encoding="utf-8") as fh:
+        fh.write('CTR_ONLY="alice # bob"  # who to watch\nCTR_CAP=\'off\' # trailing\n')
+    got = m.read_env_file(qc)
+    check("read_env_file: a quoted value keeps its # and drops the comment after it",
+          got.get("CTR_ONLY") == "alice # bob" and got.get("CTR_CAP") == "off")
+    for bad_line in ('CTR_ONLY="alice\n', 'CTR_ONLY="a" b\n'):
+        bq = os.path.join(d, "bad-quote.env")
+        with open(bq, "w", encoding="utf-8") as fh:
+            fh.write(bad_line)
+        try:
+            m.read_env_file(bq)
+            check(f"read_env_file: {bad_line.strip()!r} is rejected", False)
+        except m.ConfigError:
+            check(f"read_env_file: {bad_line.strip()!r} is rejected", True)
+
+
+def test_rules_do_not_leak(d: str) -> None:
+    """Holes found by review: each one let a rule be skipped or a choice be thrown away.
+
+    A refused window counted as usable at the highest allowed limit; nan in a limit slipped past
+    every clamp and switched the weekly limit off; one timed-out probe rotated a pinned credential
+    away and dropped the pin; an exported but empty CTR_X masked the .env value.
+    """
+    now = time.time()
+    saved = m.LIMIT_5H, m.LIMIT_7D
+    try:
+        m.LIMIT_5H = m.LIMIT_7D = 101.0
+        spent = {**reading(100, 40), "s5h": "rejected", "ok": False, "code": 429}
+        check("a refused window is never usable, even with the limits at 101", not m.usable(spent))
+    finally:
+        m.LIMIT_5H, m.LIMIT_7D = saved
+
+    blip = {"err": "timed out"}
+    check("unpinned: one timed-out probe does not swap the live credential",
+          m.needs_rotate(blip, False, now=now)[0] is False)
+    check("pinned: one timed-out probe keeps the pin", m.needs_rotate(blip, True, now=now)[0] is False)
+    check("a refusal is not a blip: unauthorized still rotates",
+          m.needs_rotate({"err": "unauthorized"}, True, now=now)[0] is True)
+    half = {**reading(10, 10), "r5h": str(now + 600)}
+    del half["u7d"]
+    check("pinned with the weekly window unread is not held",
+          m.needs_rotate(half, True, now=now)[0] is True)
+
+    for v in ("nan", "inf", "-inf"):
+        try:
+            m.load_config(os.devnull, {"CTR_LIMIT_7D": v})
+            check(f"CTR_LIMIT_7D={v} is refused", False)
+        except m.ConfigError:
+            check(f"CTR_LIMIT_7D={v} is refused", True)
+
+    envf = os.path.join(d, "fallthrough.env")
+    with open(envf, "w", encoding="utf-8-sig") as fh:        # with a BOM, as some editors save
+        fh.write("CTR_LIMIT_7D=80\nexport\tCTR_LIMIT_5H=55\n")
+    got = m.load_config(envf, {"CTR_LIMIT_7D": ""})
+    check("an exported but empty CTR_X falls through to .env", got["limit_7d"] == 80.0)
+    check("a BOM and export<TAB> are read", got["limit_5h"] == 55.0)
+
+
+def test_burn_does_not_leak(d: str) -> None:
+    """Holes found by review of the spend-down rule, each reproduced before it was closed.
+
+    A hold chosen on Sunday evening carried on into Monday; it outlived a weekly window that reset
+    early; a 7d refusal behind a 5h warning went unseen; equal readings either side of hours
+    nobody watched counted as idle.
+    """
+    now = 1_800_000_000.0
+    H = 3600.0
+    r = {**reading(90, 95), "r7d": str(now + H)}
+    check("hold: not once the day off is over", not m.burn_holds(r, now + H, now, off=False))
+    check("hold: still on a day off", m.burn_holds(r, now + H, now, off=True))
+    fresh = {**reading(90, 3), "r7d": str(now + 7 * 24 * H)}
+    check("hold: ends when the weekly window reset early (a new week)",
+          not m.burn_holds(fresh, now + H, now))
+    full = {**reading(50, 100), "r7d": str(now + H)}
+    check("hold: ends at a full weekly window even if its status says allowed",
+          not m.burn_holds(full, now + H, now))
+    check("hold: a failed probe keeps it", m.burn_holds({"err": "timed out"}, now + H, now))
+    hidden = {**reading(50, 100), "s5h": "allowed_warning", "s7d": "rejected",
+              "r7d": str(now + H)}
+    check("a 7d refusal behind a 5h warning is still a refusal", m.refused(hidden))
+    check("…so it does not hold", not m.burn_holds(hidden, now + H, now))
+    check("…and is not chosen", m.burn_reason(hidden, now=now, still_since=now - 3 * H,
+                                              on_machine=False, off=True) == "")
+    check("…and is not usable", not m.usable(hidden))
+
+    still: dict = {}
+    m.track_still(still, {tok("A"): reading(10, 20)}, now - 6 * H, max_gap=200.0)
+    m.track_still(still, {tok("A"): reading(10, 20)}, now, max_gap=200.0)
+    check("idle clock: a gap nobody watched restarts it", still[tok("A")][1] == now)
+    m.track_still(still, {tok("A"): reading(10, 20)}, now + 100, max_gap=200.0)
+    check("idle clock: refreshes inside the gap keep it", still[tok("A")][1] == now)
+
+
+def test_one_writer_and_prompts_time_out(d: str) -> None:
+    """Two dashboards fought over the live credential; a prompt left open froze every rule.
+
+    The second dashboard on a machine now only watches, and a prompt with no answer cancels
+    itself, so the refreshes — and with them the limits — come back.
+    """
+    lock = os.path.join(d, "x.lock")
+    first = m.take_lock(lock)
+    check("lock: the first dashboard gets it", first is not None)
+    out = subprocess.run([sys.executable, "-c",
+                          "import sys; sys.path.insert(0, sys.argv[1]); import main as m; "
+                          "print(m.take_lock(sys.argv[2]) is None)",
+                          os.path.dirname(os.path.dirname(os.path.abspath(__file__))), lock],
+                         capture_output=True, text=True).stdout.strip()
+    check("lock: a second process does not", out == "True")
+
+    check("burn record: one still ahead is read back",
+          m.burn_record({"burn": {"id": "x", "until": 2e9}}, 1e9) == ("x", 2e9))
+    check("burn record: one already past is dropped",
+          m.burn_record({"burn": {"id": "x", "until": 1e9}}, 2e9) is None)
+    now, H = 1_800_000_000.0, 3600.0
+    wobble = {**reading(90, 95), "r7d": str(now + H + 120)}
+    check("hold: two sources disagreeing by minutes do not end it",
+          m.burn_holds(wobble, now + H, now))
+
+    import pty
+    pid, fd = pty.fork()
+    if pid == 0:
+        import main as mm
+        with mm.Keys() as k:
+            t0 = time.time()
+            a = mm.ask(k, "row? ", timeout=0.5)
+            print("RESULT", repr(a), round(time.time() - t0, 1), flush=True)
+        os._exit(0)
+    buf = b""
+    end = time.time() + 5
+    while time.time() < end and b"RESULT" not in buf:
+        try:
+            buf += os.read(fd, 4096)
+        except OSError:
+            break
+    os.waitpid(pid, 0)
+    txt = buf.decode(errors="replace")
+    check("ask: no answer within the deadline is a cancel",
+          "RESULT ''" in txt and "no answer" in txt)
+
+
+def test_burn_refinements(d: str) -> None:
+    """A spend-down worth two swaps: not minutes before the reset, not into a 5h window about to
+    be refused. The live credential and the in-flight hold are covered by the pty runs."""
+    now = 1_800_000_000.0
+    H = 3600.0
+    near = {**reading(50, 80), "r7d": str(now + 10 * 60)}
+    check("burn_left: not with 10 minutes left", m.burn_left(near, now) == "")
+    ok = {**reading(50, 80), "r7d": str(now + 3 * H)}
+    check("burn_left: 3 hours left is worth it", "20% left" in m.burn_left(ok, now))
+    hot = {**reading(96, 80), "r7d": str(now + 3 * H)}
+    check("burn_left: not into a 5h window at the ceiling", m.burn_left(hot, now) == "")
+    check("burn_reason: inherits both", m.burn_reason(hot, now=now, still_since=now - 3 * H,
+                                                      on_machine=False, off=True) == "")
+
+
+def test_eve_counts_as_off(d: str) -> None:
+    """Off hours are weekends, holidays, and every night 22:00-07:00: work ends at 17:00, and
+    whatever resets at 03:00 on a Thursday is just as lost as on a Sunday."""
+    at = (lambda y, mo, dd, h, mi=0: datetime.datetime(y, mo, dd, h, mi).timestamp())
+    check("night: Thursday 21:59 is working time", not m.day_off(at(2026, 10, 8, 21, 59), set()))
+    check("night: Thursday 22:00 is off", m.day_off(at(2026, 10, 8, 22, 0), set()))
+    check("night: Friday 03:00 is still off", m.day_off(at(2026, 10, 9, 3, 0), set()))
+    check("night: Friday 07:00 is working time", not m.day_off(at(2026, 10, 9, 7, 0), set()))
+    check("night: Friday 12:00 is working time", not m.day_off(at(2026, 10, 9, 12, 0), set()))
+    check("weekend: Friday 22:00 to Monday 07:00",
+          m.day_off(at(2026, 10, 9, 22, 0), set()) and m.day_off(at(2026, 10, 10, 12, 0), set())
+          and m.day_off(at(2026, 10, 12, 6, 59), set())
+          and not m.day_off(at(2026, 10, 12, 7, 0), set()))
+    xmas = {"2026-12-25"}                                 # a Friday
+    check("holiday: off all day", m.day_off(at(2026, 12, 25, 12, 0), xmas))
+    check("holiday: the evening before is working time until 22:00",
+          not m.day_off(at(2026, 12, 24, 21, 0), xmas) and m.day_off(at(2026, 12, 24, 22, 0), xmas))
+    check("night: 24 / 0 switch nights off",
+          not m.day_off(at(2026, 10, 8, 23, 0), set(), night_from=24, night_until=0)
+          and not m.day_off(at(2026, 10, 9, 3, 0), set(), night_from=24, night_until=0))
+
+def test_unseen_counts_as_idle(d: str) -> None:
+    """A credential nobody has watched yet gets the benefit of the doubt, so a spend-down does not
+    wait hours after a start; one seen moving while watched still waits."""
+    still: dict = {}
+    m.track_still(still, {tok("A"): reading(10, 20)}, 1000.0, unseen_idle=7200.0)
+    check("unseen: first sighting counts as idle already", still[tok("A")][1] == 1000.0 - 7200.0)
+    m.track_still(still, {tok("A"): reading(12, 20)}, 1060.0, unseen_idle=7200.0)
+    check("unseen: once seen moving it waits like anyone", still[tok("A")][1] == 1060.0)
+    m.track_still(still, {tok("A"): reading(12, 20)}, 99999.0, max_gap=200.0, unseen_idle=7200.0)
+    check("unseen: after a gap nobody watched it is unseen again",
+          still[tok("A")][1] == 99999.0 - 7200.0)
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
@@ -686,7 +1199,8 @@ def main() -> int:
                    test_rows_added_while_running,
                    test_park_mode,
                    test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
-                   test_file_mode, test_header_sort):
+                   test_file_mode, test_header_sort, test_burn_before_weekly_reset, test_holiday_file,
+                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

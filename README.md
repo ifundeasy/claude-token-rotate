@@ -73,7 +73,15 @@ bob,sk-ant-oat01-...
 ```
 
 Mint a token per account with `claude setup-token`. Column order does not matter, extra columns
-survive a rewrite, and rows with an empty token are skipped. Use `--csv PATH` for a file elsewhere.
+survive a rewrite, and rows with an empty token are skipped. Use `CTR_CSV` or `--csv PATH` for a
+file elsewhere.
+
+Settings live in `.env` beside the script — start from the documented template, which lists every
+key with its default (see [Configuration](#configuration)):
+
+```bash
+cp .env.example .env
+```
 
 > **Every refresh costs something.** Quota headers only appear on a call that bills inference, so
 > one refresh is one `max_tokens=1` call per credential. The counter is always visible in the
@@ -85,9 +93,10 @@ survive a rewrite, and rows with an empty token are skipped. Use `--csv PATH` fo
 |---|---|
 | `h` `w` `o` `b` | view 5h / 7d / extra credits / all |
 | `r` `s` `i` `D` | refresh · cycle sort · raw headers · diagnose one credential |
-| `1-9` `10`… `c` `p` `x` | copy that row's token (type two digits for row 10 and up) · copy any row by number · copy the freshest · copy the table as Markdown |
+| `1-9` `10`… `c` `f` `x` | copy that row's token (type two digits for row 10 and up) · copy any row by number · copy the freshest · copy the table as Markdown |
 | `a` `d` `e` | add · delete · edit a credential (name and/or token) |
-| **`t`** **`z`** **`T`** | **hand a token to Claude Code · switch to your /login and back · auto-swap off/park/on** |
+| **`p`** **`z`** **`T`** | **pin a token live for Claude Code (`t`, the old key, still works) · switch to your /login and back · auto-swap off/park/on** |
+| `u` | lift the pin `p` made — until then auto-rotate keeps its hands off it and no spend-down starts |
 | `+` `-` `q` | interval · quit |
 | click a header | sort by that column; click it again to reverse (▼ highest or latest first, ▲ lowest or soonest first) |
 
@@ -115,7 +124,7 @@ carried the variable). This is **file mode**, the default.
 
 | How | Behaviour |
 |---|---|
-| **Manual** (`t`) | pick a row, or leave blank for the freshest → confirm → the credentials file holds it, open sessions switch on their next request · **pinned** |
+| **Manual** (`p`) | pick a row, or leave blank for the freshest → confirm → the credentials file holds it, open sessions switch on their next request · **pinned** |
 | **Auto** (`T`) | cycles three ways — see below |
 | **Off / on** (`z`) | off: your `/login` goes back into the credentials file · on: the recorded token again |
 
@@ -138,16 +147,24 @@ them.
 usable credentials the one whose weekly window resets soonest is picked — the weekly quota is the
 scarce one. When two weekly resets are less than an hour apart, the sooner 5h reset decides.
 Ranking on headroom alone used to tie credentials at the same busiest window and let CSV order pick
-one with days of week left over another whose week ended in hours. `t`'s "freshest" pick still
+one with days of week left over another whose week ended in hours. `p`'s "freshest" pick still
 ranks on headroom, since its job is the least bad option when nothing is usable.
 
 There is no "beat the incumbent by N points" rule. The limits already say what counts as a sound
 replacement, and a margin on top would reject candidates that are plainly fine. When nothing is
 usable, auto-rotate stays put and says so once.
 
+### Rebalance: the week that resets first goes first
+
+The limits decide when the live credential **has** to go. Rebalance decides when it **should**:
+while it is fine, a usable credential whose weekly reset comes more than an hour
+(`CTR_RESET_TIE`) sooner takes over — whatever it has left is lost sooner. Only with `T` on, never
+over a pin, never more often than `CTR_ROTATE_GAP`. `CTR_REBALANCE=false` turns it off, leaving
+rotation to the limits alone.
+
 ### Pinned credentials
 
-`t` pins the credential you picked. Auto-rotate still moves a pinned credential, with one
+`p` pins the credential you picked. Auto-rotate still moves a pinned credential, with one
 allowance — when its quota is about to come back, it is worth riding out:
 
 | Pinned credential | Auto-rotate |
@@ -163,9 +180,50 @@ away clears the pin. It survives a restart, recorded in `data.json` as a digest,
 token. A spent window is easy to miss — its 429 still carries the quota headers, so the only sign is
 the status — and the pin used to overlook it and hold a spent credential indefinitely.
 
-`t` is also the forced pick in the other sense: choosing "the freshest" from its prompt ignores the
+`p` is also the forced pick in the other sense: choosing "the freshest" from its prompt ignores the
 limits entirely, so it still answers when nothing is usable. Refusing to name one would leave you
 with nothing, when what you asked for was the least bad option.
+
+### Spending a week down before it resets
+
+Whatever is left of a weekly window at its reset is lost. In **off hours** — a weekend, an
+Indonesian national holiday, or any night — auto-rotate makes a credential live with **both limits waived** when all of these hold:
+
+| Condition | How it is checked |
+|---|---|
+| off hours | Saturday, Sunday, a date in `holidays.txt`, or **any night 22:00–07:00** (local clock) — so a weekend runs Friday 22:00 to Monday 07:00 |
+| not in use on this machine | not the live credential, and no running session carries it |
+| nobody else on it either | its 5h and 7d readings have not moved for **2 hours** while watched — one not watched yet (just after a start) counts as idle, so it can be picked at once (`CTR_BURN_UNSEEN`) |
+| its weekly window resets in **under 7 hours** | the `r7d` header |
+| quota left | weekly under 100% and not `rejected` |
+| worth two swaps | at least 15 minutes left before the reset |
+| not about to be refused | its 5h window under 95% — it qualifies again once that window resets |
+
+The live credential itself gets the same treatment, minus the idle test (it is the one in use):
+in off hours, with its week worth spending, it is **kept** instead of being rotated
+away only to come back as an idle candidate two hours later.
+
+Among several, the soonest weekly reset goes first — also during a spend-down: a credential that
+became eligible since and loses its week more than an hour earlier takes over. It stays live past 66% weekly and past 61% 5h,
+and the footer says so, only for as long as **all** of these still hold:
+
+- it is still off hours — a night ends at 07:00, so a weekend hold ends at Monday 07:00;
+- its weekly window has not reset — at the reset it was chosen for, or an earlier one;
+- no window is refused and the weekly window is not full;
+- auto-rotate is still `on` and the rule still enabled;
+- nobody swapped by hand (`p`, `z`, or `e` on the live row end it).
+
+Then the ordinary rules take over. A pin made with `p` outranks it. It survives a restart
+(`data.json`, as a digest). Time nobody watched does not count as idle: after a restart, a sleep,
+or hours of failed probes, a credential has to be watched for the full 2 hours again. It only acts
+with `T` on — in `park` and `off` it does nothing.
+`CTR_BURN_WINDOW` and `CTR_BURN_IDLE` (minutes) and `CTR_BURN` in `.env` — or `--burn-window`,
+`--burn-idle`, `--no-burn` — change or disable it.
+
+`holidays.txt` beside the binary lists the national holidays (libur nasional — **cuti bersama is
+not included**), one `YYYY-MM-DD` per line, anything after the date is its name, `#` starts a
+comment. A missing file means weekends only. It is read on every check, so a new year can be added
+without a rebuild or a restart.
 
 ### `T` cycles three ways
 
@@ -183,13 +241,13 @@ wishes:
 **A switched-off credential is kept fresh, but stays off.** Writing a value and switching it on are
 separate decisions, and the second one is yours. With `z` off, auto-rotate still updates the
 recorded value, so turning it back on hands you the best credential rather than whatever was there
-hours ago — but it never switches it on. Only `t` does that, and `t` is the deliberate override.
+hours ago — but it never switches it on. Only `p` does that, and `p` is the deliberate override.
 
 ### How the two files carry it
 
 | Trigger | `~/.zshenv` — a record, always switched off | `~/.claude/.credentials.json` — what Claude Code uses |
 |---|---|---|
-| `t` inject | records the token | `claudeAiOauth` → that token |
+| `p` pin | records the token | `claudeAiOauth` → that token |
 | `z` off | unchanged | `claudeAiOauth` → your `/login`, exactly as it was |
 | `z` on | unchanged | `claudeAiOauth` → the recorded token |
 | auto-rotate `on` | records the pick | follows it, if a token was live |
@@ -227,7 +285,7 @@ Two cases where switching off does **not** restore:
 
 **`--export-env`** brings back the old behaviour: the shell file exports the variable as well, so
 scripts that need `CLAUDE_CODE_OAUTH_TOKEN` get it — and every session started from that shell
-inherits it and needs a restart per swap (`t` then offers `claude daemon stop --any`).
+inherits it and needs a restart per swap (`p` then offers `claude daemon stop --any`).
 `--no-creds-write` implies it, `--creds-file PATH` points at another credentials file, and
 `--no-env-write` blocks every write. On macOS there is no credentials file to write, so it is env
 mode there.
@@ -322,7 +380,7 @@ python3 main.py --env-file ~/.bashrc
 
 ### Safeguards
 
-- `--no-env-write` disables all writing, credentials file included; `t` `z` `T` become read-only
+- `--no-env-write` disables all writing, credentials file included; `p` `z` `T` become read-only
 - `--no-creds-write` leaves `.credentials.json` alone and falls back to exporting the variable
 - Refuses to write when more than one `export` line is active — guessing would be worse
 - Refuses to rewrite a `.credentials.json` that is not valid JSON
@@ -330,6 +388,14 @@ python3 main.py --env-file ~/.bashrc
   and the parked login are always 0600
 - Symlinks are followed to their target, so a dotfiles repo is not detached
 - Token values are never printed to the screen
+- **One writer per machine.** The first dashboard takes a lock (`data.json.lock`); a second one
+  only watches — no rotation, `p` `z` `T` read-only — so two cannot swap the live credential back
+  and forth or undo each other's pins. The pin and spend-down state are re-read from `data.json`
+  on every check, and `data.json` is written atomically too
+- **A prompt cannot freeze the rules.** Nothing refreshes while a prompt (`p`, `a`, `e`, `d`, `D`)
+  waits for an answer, so one with no answer for 2 minutes cancels itself
+- **A blip is not a verdict.** One timed-out or 5xx probe keeps the live credential (and its pin)
+  until the next refresh; a refusal still rotates it
 
 ---
 
@@ -341,6 +407,16 @@ python3 main.py --env-file ~/.bashrc
 Opus 5 (1M context) xhigh │ Dirs +0 · 14:30:00   │ Context 414.2k/1M · 41% │ Hourly 13% · 12 Sep 01:10
 carol sk...3zR8nAAA       │ Session 414.2k (99%) │  ⚠ $12.80 · $0.04/min   │ Weekly 27% · 15 Sep 23:00
 ```
+
+`plugin/statusline_simple.md` is the one-row alternative:
+
+```
+Opus 5.5 / xhigh │ Wita ...R9LetgAA │ 5h 59% / 1h 02m │ 7d 77% / 2d 3h
+```
+
+model / effort, the credential (name and the last 8 characters of its token), then each window's
+use and the time to its reset. It names the credential by the same rule as the grid below. Point
+`statusLine.command` at whichever of the two you want.
 
 The **account** cell (row two, first column) is what ties this to the dashboard. It names the
 credential **this session** is using, and works it out on every render:
@@ -454,31 +530,73 @@ alias ctr='python3 /path/to/claude-token-rotate/main.py'
 
 ---
 
-## Flags
+## Configuration
+
+Every setting has a key in `.env` beside the binary (or `main.py`). `.env.example` is the tracked,
+commented template: it lists **every** key with its built-in default, so a fresh copy behaves
+exactly like no `.env` at all. `.env` itself is git-ignored.
+
+```bash
+cp .env.example .env     # then edit what you need
+```
+
+Highest wins:
+
+```
+command-line flag  >  CTR_* exported in the environment  >  .env  >  built-in default
+```
+
+`CTR_LIMIT_7D=80 claude-token-rotate` overrides the file for one run. An empty value means the
+default. An unknown `CTR_` key, a bad number or a bad boolean stops the program with the key and
+where it came from — a typo cannot silently do nothing. Relative paths are taken beside the binary.
+
+| `.env` key | Flag | Default | What it does |
+|---|---|---|---|
+| `CTR_CSV` | `--csv PATH` | `token.csv` | credential list |
+| `CTR_ONLY` | `--only NAMES` | all | watch a subset (comma-separated names) |
+| `CTR_HOLIDAYS` | `--holidays PATH` | `holidays.txt` | national holidays for the spend-down rule |
+| `CTR_ENV_FILE` | `--env-file PATH` | `~/.zshenv` | shell file that records the live credential |
+| `CTR_CREDS_FILE` | `--creds-file PATH` | `~/.claude/.credentials.json` (or under `$CLAUDE_CONFIG_DIR`) | the file Claude Code reads, kept in step |
+| `CTR_LOG` | `--log CSV` | off | append every reading for later analysis |
+| `CTR_INTERVAL` | `--interval SEC` | `60` | seconds between refreshes |
+| `CTR_TIMEOUT` | `--timeout SEC` | `30` | per-probe HTTP timeout |
+| `CTR_VIEW` | `--view b\|h\|w\|o` | `b` | starting view |
+| `CTR_SORT` | `--sort csv\|5h\|7d\|ov\|name\|r5h\|r7d` | `csv` | starting order (`r5h`/`r7d`: soonest reset first) |
+| `CTR_ALERT` | `--alert PCT` | off | ring the bell when a window crosses this |
+| `CTR_CAP` | `--cap USD\|auto\|off` | `auto` | extra-credit cap; `auto` reads it from `/api/oauth/usage` |
+| `CTR_COLOR` | `--[no-]color` | `true` | ANSI colour |
+| `CTR_TITLE` | `--[no-]title` | `true` | live credential in the terminal title |
+| `CTR_MOUSE` | `--[no-]mouse` | `true` | header clicks; while on, drag-to-select needs `Shift` |
+| `CTR_NOTIFY` | `--[no-]notify` | `true` | desktop notification when the live credential is past its limits and still in use |
+| `CTR_ROTATE_MODE` | `--rotate-mode off\|park\|on` | last `T` | what auto-rotate may do (`--auto-rotate` = `on`) |
+| `CTR_LIMIT_5H` | `--limit-5h PCT` | `61` | usable while 5h is below this (at most 60%) |
+| `CTR_LIMIT_7D` | `--limit-7d PCT` | `66` | usable while weekly is below this (at most 65%) |
+| `CTR_ROTATE_GAP` | `--rotate-gap SEC` | `15` | least time between two automatic swaps |
+| `CTR_RESET_TIE` | `--reset-tie MIN` | `60` | weekly resets this close tie, and the 5h reset decides |
+| `CTR_PIN_GRACE` | `--pin-grace MIN` | `60` | a pinned credential over 5h is kept when 5h resets within this… |
+| `CTR_PIN_CEILING` | `--pin-ceiling PCT` | `95` | …until its 5h reaches this |
+| `CTR_BURN` | `--[no-]burn` | `true` | spend a week down before it resets, on days off |
+| `CTR_BURN_WINDOW` | `--burn-window MIN` | `420` | …when the weekly reset is under this far away (7h) |
+| `CTR_BURN_IDLE` | `--burn-idle MIN` | `120` | …and its readings have not moved for this long (2h) |
+| `CTR_BURN_MIN` | `--burn-min MIN` | `15` | …but not with less than this left before the reset |
+| `CTR_BURN_UNSEEN` | `--[no-]burn-unseen` | `true` | a credential not watched yet counts as idle (no 2h wait after a start) |
+| `CTR_REBALANCE` | `--[no-]rebalance` | `true` | move to a usable credential whose week resets sooner |
+| `CTR_NIGHT_FROM` | `--night-from HOUR` | `22` | every night from this hour counts as off hours (`24` = no nights) |
+| `CTR_NIGHT_UNTIL` | `--night-until HOUR` | `7` | …until this hour in the morning (`0` = nights end at midnight) |
+| `CTR_ENV_WRITE` | `--[no-]env-write` | `true` | write the shell file at all (false: `p`/`T`/`z` read-only) |
+| `CTR_CREDS_WRITE` | `--[no-]creds-write` | `true` | write the credentials file (false implies the export way) |
+| `CTR_EXPORT_ENV` | `--[no-]export-env` | `false` | also export the token from the shell file (a restart per swap) |
+
+One-off actions are flags only:
 
 | Flag | What it does |
 |---|---|
-| `--csv PATH` | credential list (default: beside the script) |
-| `--from-env [FILE]` | read from the environment instead of a CSV (list is read-only) |
-| `--only NAMES` | watch a subset |
-| `--interval N` `--timeout N` | seconds between refreshes · per-probe timeout |
-| `--view b\|h\|w\|o` `--sort csv\|5h\|7d\|ov\|name\|r5h\|r7d` | initial view · initial order (`r5h`/`r7d`: soonest reset first) |
-| `--no-mouse` | no header clicks, so plain drag-to-select works without `Shift` |
-| `--alert PCT` | ring the terminal bell when a window crosses this |
-| `--log CSV` | append every reading for later analysis |
-| `--cap USD\|auto\|off` | extra-credit cap; `auto` reads it from `/api/oauth/usage` |
-| `--env-file PATH` | shell file to manage (default `~/.zshenv`) |
-| `--limit-5h PCT` | a credential is usable while its 5h window is below this (default 61, i.e. at most 60%) |
-| `--limit-7d PCT` | a credential is usable while its weekly window is below this (default 66) |
-| `--export-env` | also export `CLAUDE_CODE_OAUTH_TOKEN` from the shell file (the old way — a restart per swap) |
-| `--auto-rotate` | start with auto-swap on |
-| `--no-env-write` | never write a shell file (nor the credentials file) |
-| `--creds-file PATH` | Claude Code credentials file kept in step (default `~/.claude/.credentials.json`, or under `$CLAUDE_CONFIG_DIR`) |
-| `--no-creds-write` | leave the credentials file alone; implies `--export-env` |
-| `--no-notify` | no desktop notification when the live credential is still in use |
-| `--diagnose NAME` | test both paths (API and `claude -p`) for one credential |
-| `--once` `--json` | one snapshot · as JSON |
-| `--no-title` `--no-color` | leave the terminal title alone · no colour |
+| `--once` `--json` | one snapshot, then exit · as JSON |
+| `--diagnose NAME` `--no-cli` | test both paths (API and `claude -p`) for one credential · skip the `claude -p` half |
+| `--from-env [FILE]` | read `CLAUDE_CODE_OAUTH_TOKEN*` from the environment or a file instead of a CSV (read-only list) |
+
+The status-line scripts are run by Claude Code, not by this program, so they do not read `.env`;
+they take their own `STATUSLINE_*` variables (see [Statusline](#statusline)).
 
 ---
 
@@ -487,9 +605,11 @@ alias ctr='python3 /path/to/claude-token-rotate/main.py'
 | File | When |
 |---|---|
 | `token.csv` (+ `.bak`) | on `a` / `d` / `e` |
-| `data.json` | cap cache and auto-swap setting (SHA-256 prefixes, **not** tokens) |
-| `~/.zshenv` (+ `.claude_token_rotate.bak`, `.claude_token_rotate.orig`) | the record, on `t` / auto-swap / `e`, and once at startup to move an exported token over |
-| `~/.claude/.credentials.json` — the `claudeAiOauth` block only | on `t` / `z` / auto-swap / `e` — this is what Claude Code uses (Linux only) |
+| `data.json` | cap cache, auto-swap setting, pin and spend-down state (SHA-256 prefixes, **not** tokens) |
+| `.env` | read only — settings (copied from `.env.example`) |
+| `holidays.txt` | read only — national holidays for the spend-down rule |
+| `~/.zshenv` (+ `.claude_token_rotate.bak`, `.claude_token_rotate.orig`) | the record, on `p` / auto-swap / `e`, and once at startup to move an exported token over |
+| `~/.claude/.credentials.json` — the `claudeAiOauth` block only | on `p` / `z` / auto-swap / `e` — this is what Claude Code uses (Linux only) |
 | `~/.claude/.credentials.json.claude_token_rotate.login` | your parked `/login` while a token is injected; removed on restore |
 | `dist/`, `.build/` | only on `./build.sh` |
 | `~/.claude/settings.json` | only if you install the statusline yourself |
