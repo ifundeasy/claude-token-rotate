@@ -253,3 +253,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# a running dashboard holds this
+data.json.lock

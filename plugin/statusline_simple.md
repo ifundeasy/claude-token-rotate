@@ -1,5 +1,6 @@
 #!/bin/bash
-# Simple one-row status line: <model> / <effort> │ <name> ...<token tail>  5h X% / 7d Y%
+# Simple one-row status line:
+#   <model> / <effort> │ <name> ...<token tail> │ 5h X% / <reset in> │ 7d Y% / <reset in>
 #
 # A separate, smaller sibling of statusline_command.md (the 2-row grid), which this
 # leaves alone. Same identity rule as the grid, trimmed: the token comes from the
@@ -72,9 +73,19 @@ else
   [ -n "$email" ] && line="${BOLD}${email:0:64}${RESET}"
 fi
 
-IFS=$'\x1f' read -r p5 p7 model effort _ <<< "$(printf '%s' "$input" | jq -r '
+# Time to each reset, from the payload's epoch: "45m" under an hour, "3h 20m" under a
+# day, "2d 4h" beyond. A reset already in the past reads "now" until the next render.
+IFS=$'\x1f' read -r p5 p7 r5 r7 model effort _ <<< "$(printf '%s' "$input" | jq -r '
+  def pad2: tostring | if length == 1 then "0" + . else . end;
+  def left: if . == null then "" else ((. - now) | floor) as $s
+    | if $s <= 0 then "now"
+      elif $s < 3600 then "\($s / 60 | floor)m"
+      elif $s < 86400 then "\($s / 3600 | floor)h \(($s % 3600) / 60 | floor | pad2)m"
+      else "\($s / 86400 | floor)d \(($s % 86400) / 3600 | floor)h" end end;
   [ (.rate_limits.five_hour.used_percentage | if . == null then "" else (. | round | tostring) end),
     (.rate_limits.seven_day.used_percentage | if . == null then "" else (. | round | tostring) end),
+    (.rate_limits.five_hour.resets_at | left),
+    (.rate_limits.seven_day.resets_at | left),
     (.model.display_name // .model.id // ""),
     (.effort.level // ""),
     "" ] | join("\u001f")' 2>/dev/null)"
@@ -88,13 +99,19 @@ if [ -n "$model" ]; then
   [ -n "$effort" ] && head="${head} ${DIM}/ ${effort}${RESET}"
 fi
 
-quota=""
-if [ -n "$p5" ]; then pct_color "$p5"; quota="${DIM}5h${RESET} ${REPLY}${p5}%${RESET}"; fi
-if [ -n "$p7" ]; then
-  pct_color "$p7"
-  [ -n "$quota" ] && quota="${quota} ${DIM}/${RESET} "
-  quota="${quota}${DIM}7d${RESET} ${REPLY}${p7}%${RESET}"
-fi
-[ -n "$quota" ] && { [ -n "$line" ] && line="${line}  ${quota}" || line="$quota"; }
-[ -n "$head" ] && { [ -n "$line" ] && line="${head} ${DIM}│${RESET} ${line}" || line="$head"; }
+# One cell per window: "5h 59% / 1h20m". A window the payload does not carry is
+# left out, and so is a reset it does not give.
+sep=" ${DIM}│${RESET} "
+cell() { # $1 label, $2 pct, $3 reset-in
+  pct_color "$2"
+  REPLY="${DIM}$1${RESET} ${REPLY}$2%${RESET}"
+  [ -n "$3" ] && REPLY="${REPLY} ${DIM}/ ${3//[^[:print:]]/}${RESET}"
+}
+for w in 5h 7d; do
+  if [ "$w" = 5h ]; then p="$p5" r="$r5"; else p="$p7" r="$r7"; fi
+  [ -n "$p" ] || continue
+  cell "$w" "$p" "$r"
+  [ -n "$line" ] && line="${line}${sep}${REPLY}" || line="$REPLY"
+done
+[ -n "$head" ] && { [ -n "$line" ] && line="${head}${sep}${line}" || line="$head"; }
 printf '%s\n' "$line"

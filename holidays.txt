@@ -1,0 +1,45 @@
+# Indonesian national holidays (hari libur nasional) for the spend-down rule.
+# Cuti bersama is NOT included. One date per line; text after the date is its name; # starts a
+# comment. Read on every check, so a year can be added without a rebuild or restart.
+
+# 2026 — SKB 3 Menteri: Menag 1497/2025, Menaker 2/2025, MenPAN-RB 5/2025 (19 Sep 2025)
+# https://www.kemenkopmk.go.id/sites/default/files/pengumuman/2025-09/SKB%20Libur%20Nasional%20dan%20Cuti%20Bersama%20Tahun%202026.pdf
+2026-01-01  Tahun Baru 2026 Masehi
+2026-01-16  Isra Mikraj Nabi Muhammad SAW
+2026-02-17  Tahun Baru Imlek 2577 Kongzili
+2026-03-19  Hari Suci Nyepi (Tahun Baru Saka 1948)
+2026-03-21  Idul Fitri 1447 H
+2026-03-22  Idul Fitri 1447 H
+2026-04-03  Wafat Yesus Kristus
+2026-04-05  Kebangkitan Yesus Kristus (Paskah)
+2026-05-01  Hari Buruh Internasional
+2026-05-14  Kenaikan Yesus Kristus
+2026-05-27  Idul Adha 1447 H
+2026-05-31  Hari Raya Waisak 2570 BE
+2026-06-01  Hari Lahir Pancasila
+2026-06-16  1 Muharam Tahun Baru Islam 1448 H
+2026-08-17  Proklamasi Kemerdekaan
+2026-08-25  Maulid Nabi Muhammad SAW
+2026-12-25  Kelahiran Yesus Kristus
+
+# 2027 — SKB 3 Menteri: Menag 1205/2026, Menaker 3/2026, MenPAN-RB 2/2026 (15 Sep 2026)
+# https://kemenkopmk.go.id/sites/default/files/pengumuman/2026-09/SKB%20Libur%20Nasional%20dan%20Cuti%20Bersama%20Tahun%202027.pdf
+# Idul Fitri and Idul Adha follow the sidang isbat and may still move; edit here if they do.
+2027-01-01  Tahun Baru 2027 Masehi
+2027-01-05  Isra Mikraj Nabi Muhammad SAW 1448 H
+2027-02-06  Tahun Baru Imlek 2578 Kongzili
+2027-03-08  Hari Suci Nyepi (Tahun Baru Saka 1949)
+2027-03-10  Idul Fitri 1448 H
+2027-03-11  Idul Fitri 1448 H
+2027-03-26  Wafat Yesus Kristus
+2027-03-28  Kebangkitan Yesus Kristus (Paskah)
+2027-05-01  Hari Buruh Internasional
+2027-05-06  Kenaikan Yesus Kristus
+2027-05-17  Idul Adha 1448 H
+2027-05-20  Hari Raya Waisak 2571 BE
+2027-06-01  Hari Lahir Pancasila
+2027-06-06  1 Muharam Tahun Baru Islam 1449 H
+2027-08-15  Maulid Nabi Muhammad SAW
+2027-08-17  Proklamasi Kemerdekaan
+2027-12-25  Kelahiran Yesus Kristus
+2027-12-26  Isra Mikraj Nabi Muhammad SAW 1449 H
