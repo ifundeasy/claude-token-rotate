@@ -640,7 +640,7 @@ def test_header_sort(d: str) -> None:
         at.setdefault(head[x0 - 1:x1].strip(), order)
     check("header click map: each label sorts by its own column",
           at.get("NAME") == "name" and at.get("5H") == "5h" and at.get("7D▼") == "7d"
-          and at.get("#") == "csv" and at.get("EXTRA") == "ov")
+          and at.get("#") == "csv" and "EXTRA" not in at)
     resets = [o for x0, x1, o in hits["spans"] if head[x0 - 1:x1].strip() == "RESET"]
     check("header click map: the two RESET columns sort by their own window",
           resets == ["r5h", "r7d"])
@@ -1243,6 +1243,30 @@ def test_fewer_swaps(d: str) -> None:
     check("headroom: a tight one still beats nothing", pick is not None and store.name(pick[0]) == "tight")
 
 
+def test_disabled_is_never_used(d: str) -> None:
+    """A disabled credential is never used: every rule skips it, even a pin does not keep it."""
+    store = store_with(d, live=tok("L"), other=tok("O"))
+    row = store.rows[0]
+    check("disabled: not without the column", not store.disabled(row))
+    store.set_disabled(row, True)
+    store.save()
+    again = m.Store.from_csv(store.path)
+    check("disabled: the column is added and survives a reload",
+          again.disabled(again.rows[0]) and not again.disabled(again.rows[1]))
+    again.set_disabled(again.rows[0], False)
+    check("disabled: enabling clears it", not again.disabled(again.rows[0]))
+
+    off = dict(m.DISABLED_R)
+    check("disabled: reads as a refusal", m.refused(off) and not m.usable(off))
+    check("disabled: live and pinned, it is still moved off",
+          m.needs_rotate(off, True)[0] is True and m.needs_rotate(off, False)[0] is True)
+    check("disabled: never spent down", m.burn_left(off, time.time()) == "")
+    res = {tok("L"): off, tok("O"): {**reading(90, 90), "r7d": str(time.time() + 3600)}}
+    check("disabled: never picked, even over a worse one",
+          m.rotate_pick(store, store.rows, res) is not None
+          and store.name(m.rotate_pick(store, store.rows, res)[0]) == "other")
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
@@ -1253,7 +1277,7 @@ def main() -> int:
                    test_park_mode,
                    test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
                    test_file_mode, test_header_sort, test_burn_before_weekly_reset, test_holiday_file,
-                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle, test_idle_and_nights_hold, test_fewer_swaps):
+                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle, test_idle_and_nights_hold, test_fewer_swaps, test_disabled_is_never_used):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

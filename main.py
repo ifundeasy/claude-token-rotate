@@ -152,10 +152,15 @@ USAGE
 
 KEYS
     views    h 5h    w 7d    o overage    b all
-    read     r refresh now    s cycle sort    i inspect one credential's raw headers
+    read     r refresh now    s cycle sort    ⏎ / i details of the selected credential (raw headers)
+    panels   , settings (change anything; applies at once, saved to .env)    ? all keys
+             details, diagnosis, settings and keys each take the whole screen; Esc goes back
     mouse    click a column header to sort by it, click it again to reverse
     copy     1-9 that row's token    c any row by number    f furthest from any limit    x Markdown
     manage   a add credential    d delete    e edit name and/or token
+             n disable / enable (a disabled credential is never probed nor used)
+    select   ↑/↓ or j/k (Home/End, PgUp/PgDn, or click a row) — p n c i e d D then act on it,
+             without asking for a row number; Esc clears
     shell    p pin a credential live (t also works)    u unpin    z switch on/off
              T auto-rotate off|park|on
     other    +/- interval    q quit
@@ -188,6 +193,12 @@ OAUTH_BETA = "oauth-2025-04-20"         # /v1/messages refuses an OAuth token wi
 UA = "claude-token-rotate/2.0"
 TOKEN_COL = "CLAUDE_CODE_OAUTH_TOKEN"
 NAME_COL = "Name"
+#: An optional column: a row marked yes / true / 1 / x is never used at all — never probed, never
+#: picked by any rule, moved off at once if it is live. `n` toggles it from the dashboard.
+DISABLED_COL = "Disabled"
+_DISABLED_YES = ("1", "true", "yes", "y", "x", "on", "disabled")
+#: What a disabled credential reads as: an error that is also a refusal, so every rule skips it.
+DISABLED_R: dict[str, object] = {"err": "disabled", "disabled": True}
 HIST_MAX = 24                           # readings kept per credential for the trend column
 REDACT_TAIL = 32                        # trailing characters of a token the table may show
 #: Each utilization field with the reset field beside it and the label used in messages. Pairing
@@ -391,6 +402,22 @@ class Store:
 
     def token(self, row: dict[str, str]) -> str:
         return (row.get(self.tok_col) or "").strip()
+
+    def _disabled_col(self) -> str | None:
+        return next((c for c in self.fields if (c or "").lower() == DISABLED_COL.lower()), None)
+
+    def disabled(self, row: dict[str, str]) -> bool:
+        """Whether the row is marked never to be used."""
+        col = self._disabled_col()
+        return bool(col) and str(row.get(col) or "").strip().lower() in _DISABLED_YES
+
+    def set_disabled(self, row: dict[str, str], on: bool) -> None:
+        """Mark or clear it; the column is added to the CSV the first time it is needed."""
+        col = self._disabled_col()
+        if col is None:
+            col = DISABLED_COL
+            self.fields.append(col)
+        row[col] = "yes" if on else ""
 
     # -- writing ------------------------------------------------------------
     def save(self) -> str:
@@ -2184,7 +2211,7 @@ def refused(r: dict[str, object]) -> bool:
     "allowed", so a 5h "allowed_warning" in front of a 7d "rejected" hid the refusal from every
     rule that read the note alone.
     """
-    return (state_note(r).startswith(PIN_RELEASE)
+    return (bool(r.get("disabled")) or state_note(r).startswith(PIN_RELEASE)
             or r.get("s5h") == "rejected" or r.get("s7d") == "rejected")
 
 
@@ -2351,6 +2378,29 @@ def box(lines: list[str], width: int, color: bool, accent: str = CYAN,
 
 # --------------------------------------------------------------------------- table
 
+#: The TOKEN column: "..." and the last 8 characters, the same at every terminal width.
+TOKEN_W = 11
+
+
+def _cursor_bg() -> str:
+    """A faint background for the selected row: dark grey, or light grey on a light terminal.
+
+    The row keeps its own colours on top of it — reverse video turned the whole line into a white
+    bar and lost every hue that carries meaning. COLORFGBG ("15;0", "0;15") is the one hint a
+    terminal gives about its background; without it, dark is the safer guess.
+    """
+    bg = (os.environ.get("COLORFGBG") or "").split(";")[-1]
+    return "\x1b[48;5;254m" if bg in ("7", "15") else "\x1b[48;5;236m"
+
+
+CURSOR_BG = _cursor_bg()
+
+
+def on_bg(line: str, bg: str) -> str:
+    """`line` with a background behind all of it, kept through every colour reset inside."""
+    return bg + line.replace(RESET, RESET + bg) + RESET
+
+
 def build_cols(mode: str, store: Store, rows: list[dict[str, str]], hist: dict, color: bool,
                name_w: int, tok_w: int) -> list[Col]:
     """Columns for one view. A single-window view spends the freed width on the bar and the trend."""
@@ -2362,6 +2412,8 @@ def build_cols(mode: str, store: Store, rows: list[dict[str, str]], hist: dict, 
            "o": ("uov", "rov", None, "EXTRA $" if CAP_USD else "EXTRA")}.get(mode)
 
     def c_stripe(row, r):
+        if r.get("disabled"):
+            return paint("⊘", DIM, color)
         note = state_note(r)
         if r.get("err") or note.startswith("EXTRA"):
             return paint("▎", RED, color)
@@ -2376,12 +2428,14 @@ def build_cols(mode: str, store: Store, rows: list[dict[str, str]], hist: dict, 
         return paint(store.name(row), BOLD + CYAN if live else BOLD, color)
 
     def c_token(row, r):
-        # The tail is the distinguishing part, so a narrow column keeps the end, not the start.
-        t = redact(store.token(row))
-        return paint(t if len(t) <= tok_w else "…" + t[-(tok_w - 1):], DIM, color)
+        # Always "..." and the last 8 characters, at any width: the tail is what tells two
+        # credentials apart, and a column that changes with the window is harder to scan.
+        return paint("..." + store.token(row)[-8:], DIM, color)
 
     def util(field, ceil_fn=lambda r: 100.0, width=6):
         def fn(row, r):
+            if r.get("disabled"):
+                return ""                       # never probed: nothing to show, not a "?"
             p = upct(r, field)
             if p is None:
                 return paint("off" if (field == "uov" and no_meter(r)) else "?", DIM, color)
@@ -2393,12 +2447,16 @@ def build_cols(mode: str, store: Store, rows: list[dict[str, str]], hist: dict, 
 
     def barfn(field, ceil_fn=lambda r: 100.0):
         def fn(row, r):
+            if r.get("disabled"):
+                return ""
             return bar(upct(r, field), barw, color, ceil_fn(r),
                        no_meter=(field == "uov" and no_meter(r)))
         return fn
 
     def resetfn(field, clock=False):
         def fn(row, r):
+            if r.get("disabled"):
+                return ""
             when_ = ureset(r, field)
             left = until(when_)
             return paint(f"{left} {at(when_)}" if clock else left, DIM, color)
@@ -2417,17 +2475,22 @@ def build_cols(mode: str, store: Store, rows: list[dict[str, str]], hist: dict, 
         return fn
 
     def c_state(row, r):
+        if r.get("disabled"):
+            return ""                           # ⊘ and the grey row already say it
         note = state_short(r) if mode == "b" else state_note(r)
         c = (RED if (r.get("err") or note.startswith("EXTRA")) else
              GREEN if note.startswith("allowed") else YELLOW)
         return paint(note, c, color)
 
     def c_idx(row, r):
-        return c_stripe(row, r) + " " + paint(str(rows.index(row) + 1), DIM, color)
+        # ▸ marks the credential Claude Code is using, so it shows even where colour does not.
+        live = LIVE.get("token") and store.token(row) == LIVE.get("token")
+        mark = paint("▸", CYAN, color) if live else " "
+        return c_stripe(row, r) + mark + paint(str(rows.index(row) + 1), DIM, color)
 
     cols = [Col("idx", "#", 4, ">", c_idx),
             Col("name", "NAME", name_w, "<", c_name),
-            Col("token", "TOKEN", tok_w, "<", c_token, drop=3)]
+            Col("token", "TOKEN", TOKEN_W, "<", c_token)]
 
     if single:
         f_u, f_r, f_s, label = key
@@ -2451,7 +2514,7 @@ def build_cols(mode: str, store: Store, rows: list[dict[str, str]], hist: dict, 
             Col("u7", "7D", 6, ">", util("u7d")),
             Col("b7", "", barw, "<", barfn("u7d"), drop=7),
             Col("r7", "RESET", 7, ">", resetfn("r7d"), drop=2),
-            Col("uo", "EXTRA $" if CAP_USD else "EXTRA", 9, ">", util("uov", ceiling_ov), drop=1),
+            # No EXTRA column in the all-windows view: the pool is org-wide and has its own view (o).
         ]
     cols.append(Col("state", "STATE", 0, "<", c_state))   # width 0 = take what is left
     return cols
@@ -2491,7 +2554,7 @@ def col_sort(key: str, mode: str) -> str | None:
 
 
 def table(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, *, mode: str,
-          color: bool, cols_avail: int, sort: str = "", desc: bool = False
+          color: bool, cols_avail: int, sort: str = "", desc: bool = False, cursor: str = ""
           ) -> tuple[list[str], int, list[tuple[int, int, str]]]:
     """Header rule + one line per credential, the width it actually needed, and the click map.
 
@@ -2509,19 +2572,18 @@ def table(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, *
     reserve = min(26, max([5] + [len(state_short(results.get(store.token(r), {})) if mode == "b"
                                      else state_note(results.get(store.token(r), {})))
                                  for r in rows]))
-    # Shorten the token BEFORE dropping anything. A long tail is a luxury, but the column still
-    # tells two credentials apart at nine characters — and losing it entirely to save width the
-    # shrink would have found is the wrong trade.
-    full = max((len(redact(store.token(r))) for r in rows), default=10)
-    probe = build_cols(mode, store, rows, hist, color, name_w, full)
-    fixed = sum(c.w for c in probe if c.w) + 2 * (len(probe) - 1)
-    tok_w = max(9, min(full, full - (fixed + reserve - cols_avail)))
+    tok_w = TOKEN_W                             # fixed: "..." and the last 8, at any width
     cols = fit(build_cols(mode, store, rows, hist, color, name_w, tok_w), cols_avail,
                reserve=reserve)
 
     # Render every cell once: the flexible column cannot be measured without them, and calling
-    # each fn twice would also mean building the same escape sequences twice.
-    cells = [[c.fn(row, results.get(store.token(row), {})) for c in cols] for row in rows]
+    # each fn twice would also mean building the same escape sequences twice. The selected row and
+    # disabled rows are rendered without colour and then painted as a whole — a reverse-video bar
+    # for the cursor, grey for disabled — since per-cell colours would break either up.
+    plain = {c.key: c for c in build_cols(mode, store, rows, hist, False, name_w, tok_w)}
+    special = [color and store.disabled(row) for row in rows]
+    cells = [[(plain[c.key] if special[i] else c).fn(row, results.get(store.token(row), {}))
+              for c in cols] for i, row in enumerate(rows)]
     fixed = sum(c.w for c in cols if c.w) + 2 * (len(cols) - 1)
     for j, c in enumerate(cols):
         if c.w:
@@ -2545,8 +2607,13 @@ def table(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, *
         x += c.w + 2
     head = "  ".join(heads)
     out = [" " + head, " " + paint("─" * min(used, vlen(head)), DIM, color)]
-    for row in cells:
-        out.append(" " + "  ".join(pad(row[j], c.w, c.align) for j, c in enumerate(cols)))
+    for i, row in enumerate(cells):
+        line = "  ".join(pad(row[j], c.w, c.align) for j, c in enumerate(cols))
+        if special[i]:
+            line = "\x1b[90m" + line + RESET           # disabled: the whole row grey
+        if color and store.token(rows[i]) == cursor:
+            line = on_bg(pad(line, used - 1), CURSOR_BG)   # selected: a faint bar, colours kept
+        out.append(" " + line)
     return out, used, hits
 
 
@@ -2558,8 +2625,12 @@ def summary(store: Store, rows: list[dict[str, str]], results: dict, color: bool
     """
     usable, blocked, free = 0, 0, 0.0
     best: tuple[float, str] | None = None
+    disabled = 0
     for row in rows:
         r = results.get(store.token(row), {})
+        if r.get("disabled"):
+            disabled += 1
+            continue
         note = state_note(r)
         p5 = upct(r, "u5h")
         if r.get("err") or note.startswith("EXTRA"):
@@ -2574,6 +2645,8 @@ def summary(store: Store, rows: list[dict[str, str]], results: dict, color: bool
     parts = [paint(f"{len(rows)}", BOLD, color) + " creds"]
     if blocked:
         parts.append(paint(f"{blocked} blocked", RED, color))
+    if disabled:
+        parts.append(paint(f"⊘ {disabled} disabled", DIM, color))
     parts.append(paint(f"{free:.1f}", BOLD, color) + paint(f"/{usable}", DIM, color) + " 5h free")
     if best:
         parts.append("best " + paint(best[1], GREEN, color)
@@ -2769,7 +2842,7 @@ def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, 
            sort: str, interval: int, last: float, probes: int, flash: str, color: bool,
            cols: int, live: bool, alert: float | None, inspect: str | None,
            diag: tuple[str, dict] | None = None, events: list[str] | None = None,
-           desc: bool | None = None, hits: dict | None = None) -> str:
+           desc: bool | None = None, hits: dict | None = None, cursor: str = "") -> str:
     """The whole frame as one string, so a redraw cannot tear.
 
     `hits`, when given, is filled with where the table header landed: its 0-based line in the
@@ -2784,7 +2857,7 @@ def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, 
     if desc is None:
         desc = sort in SORT_DESC
     tbl, width, spans = table(store, rows, results, hist, mode=mode, color=color,
-                              cols_avail=avail, sort=sort, desc=desc)
+                              cols_avail=avail, sort=sort, desc=desc, cursor=cursor)
     width = max(48, min(avail, width))
     stamp = time.strftime("%H:%M:%S", time.localtime(last)) if last else "--:--:--"
     meta = f"{stamp} · {sort_label(sort, desc)} · {interval}s · {probes} probes"
@@ -2795,23 +2868,10 @@ def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, 
                title=TITLES[mode], right=meta)
     out.append("")
     if hits is not None:
-        hits.update(line=len(out), spans=spans)
+        hits.update(line=len(out), spans=spans, rows=[store.token(r) for r in rows])
     out += tbl
     out.append("")
 
-    if inspect:
-        row = next((r for r in rows if store.token(r) == inspect), None)
-        if row is not None:
-            out += box(inspect_lines(store, row, results.get(inspect, {}), color), width, color,
-                       accent=MAGENTA, title="RAW HEADERS", right="i clears")
-            out.append("")
-    if diag:
-        tok, d = diag
-        row = next((r for r in rows if store.token(r) == tok), None)
-        out += box(diagnose_lines(store.name(row) if row else "?", d, color), width, color,
-                   accent=YELLOW, title="DIAGNOSE · which paths still work",
-                   right="D clears")
-        out.append("")
 
     # Notes carry a glyph and a colour so the eye can sort them without reading: ! needs you,
     # ◆ is about your shell, $ is money, ↺ is something that changed, ? is only an explanation.
@@ -2863,31 +2923,142 @@ def render(store: Store, rows: list[dict[str, str]], results: dict, hist: dict, 
 
     if live:
         out.append("")
-        g = (lambda s: paint(s, CYAN, color))
-        d = (lambda s: paint(s, DIM, color))
-        mode = str(LIVE.get("auto") or "off")
-        left = [f"{g('h')}{d(' 5h')}  {g('w')}{d(' 7d')}  {g('o')}{d(' over')}  {g('b')}{d(' all')}",
-                f"{g('1-9')}{d('/')}{g('c')}{d(' copy')}  {g('f')}{d(' freshest')}  "
-                f"{g('x')}{d(' markdown')}",
-                f"{g('p')}{d(' pin')}  {g('u')}{d(' unpin')}  {g('z')}{d(' on/off')}  {g('T')}"
-                + paint(" auto-rotate " + mode,
-                        GREEN if mode == "on" else YELLOW if mode == "park" else DIM, color)]
-        right = [f"{g('r')}{d(' refresh')}  {g('s')}{d('/click sort')}  {g('i')}{d(' raw')}  "
-                 f"{g('D')}{d(' diagnose')}  {g('+/-')}{d(' interval')}",
-                 f"{g('a')}{d(' add')}  {g('d')}{d(' delete')}  {g('e')}{d(' edit')}  "
-                 f"{g('q')}{d(' quit')}",
-                 ""]
-        # The two columns are zipped positionally, so they must be the same length; the old
-        # `range(2)` would have silently dropped anything added to one side only.
-        n = max(len(left), len(right))
-        left += [""] * (n - len(left))
-        right += [""] * (n - len(right))
-        half = (width - 6) // 2
-        out += box([pad(left[i], half) + "  " + right[i] for i in range(n)], width, color)
+        out.append(legend(color, str(LIVE.get("auto") or "off")))
     # The flash line is always there, blank or not: appearing on the first click would scroll an
     # overflowing frame by a row, and the second click on the same header would miss it.
     out.append(" " + paint("▸ " + flash, MAGENTA, color) if flash else "")
     return "\n".join(out)
+
+
+def screen(title: str, lines: list[str], width: int, height: int, color: bool,
+           hint: str = "", right: str = "", top: int = 0) -> str:
+    """A whole frame for one panel: a titled box with `lines` from `top`, then a one-line hint.
+
+    Used for everything that is not the table — details, diagnosis, settings, keys — so nothing
+    is stacked under the table any more.
+    """
+    room = max(3, height - 4)                   # box rules, the hint, the cursor's line
+    body = lines[top:top + room]
+    out = box(body or [""], width, color, title=title, right=right)
+    out.append(" " + paint(hint, DIM, color) if hint else "")
+    return "\n".join(out)
+
+
+def legend(color: bool, auto: str) -> str:
+    """The one line of keys under the table; `?` has the rest."""
+    g = (lambda s_: paint(s_, CYAN, color))
+    d = (lambda s_: paint(s_, DIM, color))
+    a = paint(auto, GREEN if auto == "on" else YELLOW if auto == "park" else DIM, color)
+    return " " + "  ".join([f"{g('↑↓')}{d(' select')}", f"{g('⏎')}{d(' details')}",
+                           f"{g('p')}{d(' pin')}", f"{g('n')}{d(' disable')}",
+                           f"{g('T')}{d(' auto ')}{a}", f"{g(',')}{d(' settings')}",
+                           f"{g('?')}{d(' keys')}", f"{g('q')}{d(' quit')}"])
+
+
+KEY_HELP = [
+    ("Move", [("↑ ↓  j k", "select a row (Home/End, PgUp/PgDn, or click it)"),
+              ("⏎  i", "details of the selected credential — raw headers and state"),
+              ("Esc  ←", "back, or clear the selection"),
+              ("click a header", "sort by it; again to reverse"), ("s", "cycle the sort")]),
+    ("Live credential", [("p", "pin the selected credential live (blank: the freshest)"),
+                         ("u", "lift the pin"), ("z", "switch to your /login and back"),
+                         ("T", "auto-rotate off → park → on")]),
+    ("Credentials", [("n", "disable / enable — a disabled one is never used, never probed"),
+                     ("a  e  d", "add · edit · delete"),
+                     ("D", "diagnose: which paths still work (spends a few calls)")]),
+    ("Copy", [("1-9  c", "copy that row's token · any row by number"),
+              ("f", "copy the freshest token"), ("x", "copy the table as Markdown")]),
+    ("View", [("h  w  o  b", "5h · 7d · extra credits · all"), ("r", "refresh now"),
+              ("+  -", "refresh interval"), (",", "settings — change anything, saved to .env"),
+              ("q", "quit (in a panel: back)")]),
+]
+
+
+def detail_lines(store: Store, row: dict[str, str], r: dict[str, object], still: dict,
+                 pinned: str, burning: "tuple[str, float] | None", color: bool) -> list[str]:
+    """Everything about one credential: what it is to this dashboard, then its raw headers."""
+    tok = store.token(row)
+    d = (lambda t: paint(t, DIM, color))
+    flags = []
+    if LIVE.get("token") == tok:
+        flags.append(paint("▸ live", CYAN, color))
+    if pinned and pinned == pin_id(tok):
+        flags.append(paint("pinned", YELLOW, color))
+    if burning and burning[0] == pin_id(tok):
+        flags.append(paint(f"spending its week down until {at(burning[1])}", MAGENTA, color))
+    if store.disabled(row):
+        flags.append(paint("⊘ disabled — never probed, never used", DIM, color))
+    out = [paint(store.name(row), BOLD, color) + d(f"  {redact(tok)}")
+           + ("  " + "  ".join(flags) if flags else "")]
+    if not r.get("disabled"):
+        for label, uf, rf in (("5h", "u5h", "r5h"), ("weekly", "u7d", "r7d")):
+            p = upct(r, uf)
+            when_ = ureset(r, rf)
+            out.append(f"  {label:<7}" + (paint(f"{p:.0f}%", hue(p, color), color) if p is not None
+                                           else d("?"))
+                       + d(f"   resets in {until(when_)} ({at(when_)})" if when_ else ""))
+        out.append(f"  {'state':<7}{state_note(r)}")
+        v = still.get(tok)
+        if v:
+            out.append(f"  {'idle':<7}" + d(f"readings unmoved for {span(time.time() - v[1])}"))
+        out.append("")
+        out += inspect_lines(store, row, r, color)[1:]
+    return out
+
+
+def help_lines(color: bool) -> list[str]:
+    out: list[str] = []
+    for group, rows_ in KEY_HELP:
+        out.append(paint(group, BOLD, color))
+        for k, what in rows_:
+            out.append("  " + pad(paint(k, CYAN, color), 16) + paint(what, DIM, color))
+        out.append("")
+    return out
+
+
+def setting_text(key: str, val: object) -> str:
+    """A setting's value as the settings screen shows it, and as it is written to .env."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, float):
+        return f"{val:g}"
+    s_ = str(val)
+    if SETTINGS.get(key, ("",) * 6)[2] == "" and os.path.isabs(s_):
+        s_ = s_.replace(app_dir() + os.sep, "").replace(os.path.expanduser("~"), "~")
+    return s_
+
+
+def settings_lines(values: dict[str, str], sel: int, color: bool, sources: dict[str, str],
+                   width: int) -> list[str]:
+    """The settings list, grouped, with the selected one highlighted. Returns display lines."""
+    out: list[str] = []
+    keys = list(SETTINGS)
+    group = ""
+    lw = max(len(v[1]) for v in SETTINGS.values()) + 2
+    for i, k in enumerate(keys):
+        g, label, unit, _step, live, what = SETTINGS[k]
+        if g != group:
+            if out:
+                out.append("")
+            out.append(paint(g, BOLD, color))
+            group = g
+        val = values.get(k, "") or "—"
+        val_s = f"{val}{(' ' + unit) if unit and values.get(k) else ''}"
+        tag = "" if live else " ↻ restart"
+        src = sources.get(k, "")
+        if src in ("flag", "env"):
+            tag += f" · set by {'a flag' if src == 'flag' else 'the environment'}"
+        plain = f"  {label:<{lw}}{val_s:<14}{what}{tag}"
+        line = (f"  {paint(f'{label:<{lw}}', '', color)}"
+                f"{paint(f'{val_s:<14}', CYAN, color)}{paint(what, DIM, color)}"
+                f"{paint(tag, YELLOW, color)}")
+        if i == sel:
+            out.append(on_bg(pad(line, width - 4), CURSOR_BG) if color else "›" + plain[1:])
+        else:
+            out.append(line)
+    return out
 
 
 def markdown(store: Store, rows: list[dict[str, str]], results: dict) -> str:
@@ -3117,8 +3288,12 @@ def ask(keys: Keys, prompt: str, secret: bool = False, timeout: float | None = N
         keys.raw()
 
 
-def pick_row(keys: Keys, store: Store, rows: list[dict[str, str]], what: str) -> int:
-    """Row number from the user, validated against what is on screen. -1 when cancelled."""
+def pick_row(keys: Keys, store: Store, rows: list[dict[str, str]], what: str,
+             cursor: str = "") -> int:
+    """The selected row when there is one, else a row number from the user. -1 when cancelled."""
+    i = next((k for k, r in enumerate(rows) if cursor and store.token(r) == cursor), -1)
+    if i >= 0:
+        return i
     ans = ask(keys, f"\n  {what} — row number (1-{len(rows)}), blank to cancel: ")
     if not ans.isdigit():
         return -1
@@ -3160,7 +3335,7 @@ CONFIG: tuple[tuple[str, object, object], ...] = (
     ("CTR_INTERVAL", "int", 60),
     ("CTR_TIMEOUT", "float", 30.0),
     ("CTR_VIEW", ("b", "h", "w", "o"), "b"),
-    ("CTR_SORT", SORTS, "csv"),
+    ("CTR_SORT", SORTS, "r7d"),                 # the week that resets first on top
     ("CTR_ALERT", "float?", None),
     ("CTR_CAP", "str", "auto"),
     ("CTR_COLOR", "bool", True),
@@ -3189,6 +3364,61 @@ CONFIG: tuple[tuple[str, object, object], ...] = (
     ("CTR_EXPORT_ENV", "bool", False),
 )
 _TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
+
+#: How each setting shows on the settings screen: (group, label, unit, step, live, what it does).
+#: `step` is what ←/→ add or take away; `live` False means it applies on the next start.
+SETTINGS: dict[str, tuple[str, str, str, float, bool, str]] = {
+    "CTR_ROTATE_MODE": ("Rotation", "Auto-rotate", "", 0, True,
+                        "off writes nothing · park records the best switched off · on swaps it in"),
+    "CTR_LIMIT_5H": ("Rotation", "Limit 5h", "%", 1, True,
+                     "usable while 5h is below this (61 = at most 60%)"),
+    "CTR_LIMIT_7D": ("Rotation", "Limit weekly", "%", 1, True,
+                     "usable while weekly is below this (66 = at most 65%)"),
+    "CTR_MIN_HEADROOM": ("Rotation", "Min headroom", "pts", 1, True,
+                         "a replacement prefers this many points below each limit"),
+    "CTR_ROTATE_GAP": ("Rotation", "Swap gap", "s", 5, True, "least time between two swaps"),
+    "CTR_RESET_TIE": ("Rotation", "Reset tie", "min", 15, True,
+                      "weekly resets this close tie; the 5h reset decides"),
+    "CTR_PIN_GRACE": ("Rotation", "5h grace", "min", 15, True,
+                      "over 5h, kept when 5h resets within this…"),
+    "CTR_PIN_CEILING": ("Rotation", "5h grace ceiling", "%", 1, True, "…until 5h reaches this"),
+    "CTR_REBALANCE": ("Rotation", "Rebalance", "", 0, True,
+                      "move to a usable credential whose week resets sooner"),
+    "CTR_REBALANCE_IDLE": ("Rotation", "Rebalance idle", "min", 5, True,
+                           "skip one whose readings moved this recently"),
+    "CTR_BURN": ("Spend-down", "Spend-down", "", 0, True,
+                 "spend a week down before it resets, in off hours"),
+    "CTR_BURN_WINDOW": ("Spend-down", "Window", "min", 60, True,
+                        "when its weekly reset is under this far away"),
+    "CTR_BURN_IDLE": ("Spend-down", "Idle", "min", 15, True,
+                      "and its readings have not moved for this long"),
+    "CTR_BURN_MIN": ("Spend-down", "Min left", "min", 5, True,
+                     "but not with less than this before the reset"),
+    "CTR_BURN_UNSEEN": ("Spend-down", "Trust unseen", "", 0, True,
+                        "a credential not watched yet counts as idle"),
+    "CTR_NIGHT_FROM": ("Spend-down", "Night from", "h", 1, True, "nights count as off hours from…"),
+    "CTR_NIGHT_UNTIL": ("Spend-down", "Night until", "h", 1, True, "…until this hour"),
+    "CTR_HOLIDAYS": ("Spend-down", "Holidays file", "", 0, True, "national holidays, one date per line"),
+    "CTR_INTERVAL": ("Dashboard", "Refresh", "s", 15, True,
+                     "seconds between refreshes (one tiny call per credential each)"),
+    "CTR_TIMEOUT": ("Dashboard", "Probe timeout", "s", 5, True, "per-probe HTTP timeout"),
+    "CTR_VIEW": ("Dashboard", "View", "", 0, True, "b all · h 5h · w 7d · o extra credits"),
+    "CTR_SORT": ("Dashboard", "Sort", "", 0, True, "starting row order"),
+    "CTR_ALERT": ("Dashboard", "Alert", "%", 5, True, "bell when a window crosses this (empty = off)"),
+    "CTR_COLOR": ("Dashboard", "Colour", "", 0, True, "ANSI colour"),
+    "CTR_TITLE": ("Dashboard", "Terminal title", "", 0, True, "live credential in the title"),
+    "CTR_MOUSE": ("Dashboard", "Mouse", "", 0, True, "clicks; while on, select text with Shift"),
+    "CTR_NOTIFY": ("Dashboard", "Notify", "", 0, True, "desktop note when a live one is past its limits"),
+    "CTR_LOG": ("Dashboard", "Log file", "", 0, True, "append every reading here (empty = off)"),
+    "CTR_CAP": ("Dashboard", "Extra-credit cap", "", 0, False, "dollars, auto or off"),
+    "CTR_CSV": ("Files", "Credential list", "", 0, False, "the CSV of names and tokens"),
+    "CTR_ONLY": ("Files", "Only", "", 0, False, "watch only these names (empty = all)"),
+    "CTR_ENV_FILE": ("Files", "Shell file", "", 0, False, "records the live credential"),
+    "CTR_CREDS_FILE": ("Files", "Credentials file", "", 0, False, "what Claude Code reads"),
+    "CTR_ENV_WRITE": ("Files", "Write shell file", "", 0, False, "false makes p / T / z read-only"),
+    "CTR_CREDS_WRITE": ("Files", "Write credentials", "", 0, False, "false falls back to exporting"),
+    "CTR_EXPORT_ENV": ("Files", "Export variable", "", 0, False, "the old way: a restart per swap"),
+}
 
 
 class ConfigError(ValueError):
@@ -3248,8 +3478,8 @@ def _beside(path: str) -> str:
     return p if os.path.isabs(p) else os.path.join(app_dir(), p)
 
 
-def load_config(path: str | None = None, environ: dict[str, str] | None = None
-                ) -> dict[str, object]:
+def load_config(path: str | None = None, environ: dict[str, str] | None = None,
+                sources: dict[str, str] | None = None) -> dict[str, object]:
     """Every setting, keyed by argparse dest: the default, then .env, then CTR_* from the environment.
 
     Command-line flags go on top of this in main(). An empty value means the default. An unknown
@@ -3268,39 +3498,77 @@ def load_config(path: str | None = None, environ: dict[str, str] | None = None
                           f"{raw[unknown[0]][1]}) — .env.example lists every key")
     out: dict[str, object] = {}
     for key, kind, default in CONFIG:
-        dest = key[len("CTR_"):].lower()
         val, where = raw.get(key, ("", ""))
-        val = val.strip()
-        if val == "":
-            out[dest] = _beside(str(default)) if kind == "path" and default else default
-            continue
-        bad = f"{key}={val!r} in {where}"
-        if isinstance(kind, tuple):
-            if val not in kind:
-                raise ConfigError(f"{bad}: expected one of {', '.join(x or '(empty)' for x in kind)}")
-            out[dest] = val
-        elif kind == "bool":
-            if val.lower() not in _TRUE + _FALSE:
-                raise ConfigError(f"{bad}: expected true or false")
-            out[dest] = val.lower() in _TRUE
-        elif kind in ("int", "float", "float?"):
-            try:
-                out[dest] = int(val) if kind == "int" else finite(val)
-            except (ValueError, argparse.ArgumentTypeError):
-                raise ConfigError(f"{bad}: expected a finite number") from None
-        elif kind == "path":
-            out[dest] = _beside(val)
-        else:
-            out[dest] = val
+        out[key[len("CTR_"):].lower()] = convert_setting(key, val, where)
+        if sources is not None:
+            sources[key] = ("env" if where == "the environment" else ".env") \
+                if val.strip() else "default"
     return out
+
+
+def convert_setting(key: str, val: str, where: str = "") -> object:
+    """One setting's text as its value — the default when empty. Raises ConfigError, naming it."""
+    kind, default = next((k, d) for k_, k, d in CONFIG if k_ == key)
+    val = val.strip()
+    if val == "":
+        return _beside(str(default)) if kind == "path" and default else default
+    bad = f"{key}={val!r}" + (f" in {where}" if where else "")
+    if isinstance(kind, tuple):
+        if val not in kind:
+            raise ConfigError(f"{bad}: expected one of {', '.join(x or '(empty)' for x in kind)}")
+        return val
+    if kind == "bool":
+        if val.lower() not in _TRUE + _FALSE:
+            raise ConfigError(f"{bad}: expected true or false")
+        return val.lower() in _TRUE
+    if kind in ("int", "float", "float?"):
+        try:
+            return int(val) if kind == "int" else finite(val)
+        except (ValueError, argparse.ArgumentTypeError):
+            raise ConfigError(f"{bad}: expected a finite number") from None
+    if kind == "path":
+        return _beside(val)
+    return val
+
+
+def write_env_value(path: str, key: str, raw: str) -> None:
+    """Set KEY=raw in the .env file, in place: comments, order and every other line untouched.
+
+    A missing .env starts as a copy of .env.example beside it (or empty). A value with spaces or a
+    `#` is quoted. Written atomically, owner-only.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        try:
+            with open(os.path.join(os.path.dirname(path), ".env.example"), encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            lines = []
+    val = f'"{raw}"' if (" " in raw or "#" in raw) and '"' not in raw else raw
+    pat = re.compile(rf"^(\s*(?:export\s+)?){re.escape(key)}\s*=")
+    for i, ln in enumerate(lines):
+        m = pat.match(ln)
+        if m:
+            lines[i] = f"{m.group(1)}{key}={val}"
+            break
+    else:
+        lines.append(f"{key}={val}")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
 
 
 # --------------------------------------------------------------------------- main
 
 def main() -> int:
     global LIMIT_5H, LIMIT_7D
+    sources: dict[str, str] = {}
     try:
-        cfg = load_config()
+        cfg = load_config(sources=sources)
     except ConfigError as exc:
         if not {"-h", "--help"} & set(sys.argv[1:]):
             raise SystemExit(f"config: {exc}")
@@ -3432,6 +3700,10 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="with --once: JSON instead of a table")
     ap.set_defaults(**cfg)
     args = ap.parse_args()
+    for _k, *_ in CONFIG:                        # a flag that differs from the config set it
+        _d = _k[len("CTR_"):].lower()
+        if getattr(args, _d, None) != cfg.get(_d):
+            sources[_k] = "flag"
     global ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING, BURN_WINDOW, BURN_IDLE, BURN_MIN
     global HOLIDAYS_PATH, NIGHT_FROM, NIGHT_UNTIL, REBALANCE_IDLE, MIN_HEADROOM
     ROTATE_GAP = max(0.0, args.rotate_gap)
@@ -3469,7 +3741,8 @@ def main() -> int:
             raise SystemExit(f"--cap {args.cap}: expected a dollar amount, 'auto' or 'off'")
     if cap_arg not in ("off", "none", "0") and sys.stderr.isatty():
         print("reading /api/oauth/usage for the extra-credit cap …", file=sys.stderr, flush=True)
-    resolve_cap(explicit, [store.token(r) for r in store.rows], args.timeout)
+    resolve_cap(explicit, [store.token(r) for r in store.rows if not store.disabled(r)],
+                args.timeout)
     color = args.color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     interval, mode, sort = min(3600, max(5, args.interval)), args.view, args.sort
     desc = sort in SORT_DESC
@@ -3602,7 +3875,12 @@ def main() -> int:
         del events[:-8]
 
     def refresh() -> dict:
-        results = probe_all(store, [store.token(r) for r in store.rows], args.timeout)
+        # A disabled credential is never called, not even for the one-token probe.
+        results = probe_all(store, [store.token(r) for r in store.rows if not store.disabled(r)],
+                            args.timeout)
+        for r in store.rows:
+            if store.disabled(r):
+                results[store.token(r)] = dict(DISABLED_R)
         refresh_pool(args.timeout)         # free, and it keeps the dollar figures exact
         record(results)
         # Two missed refreshes (plus slack for a slow probe) is a gap nobody watched.
@@ -3708,6 +3986,29 @@ def main() -> int:
             return ""                      # hidden by --only / CTR_ONLY: not probed, cannot judge
         cur = results[tok]
         now = time.time()
+        if cur.get("disabled") and time.time() - last_rotate >= ROTATE_GAP:
+            # Never used at all, so "nothing better to move to" does not apply: the best usable
+            # one, else the least bad one that is not disabled, else back to the /login.
+            pick = rotate_pick(store, rows, results, exclude=tok, strict=True) \
+                or rotate_pick(store, rows, results, exclude=tok)
+            try:
+                if pick:
+                    msg = go_live(store.token(pick[0]), False if auto_rotate == "park" else None)
+                    where = store.name(pick[0])
+                else:
+                    msg = go_live(tok, False)  # recorded but switched off: Claude Code uses /login
+                    where = "your /login (nothing else can serve)"
+            except (RuntimeError, OSError) as exc:
+                auto_rotate = "off"
+                read_live()
+                return f"auto-rotate OFF — write failed: {exc}"
+            last_rotate = now
+            _st = load_state()
+            for k in ("pinned", "pinned_until", "burn"):
+                _st.pop(k, None)
+            save_state(_st)
+            pinned, burning = "", None
+            return f"↻ {token_name(store, tok)} is disabled → {where} · {msg}"
         # data.json is the record of a pin and a spend-down, not this process's memory of it.
         _st = load_state()
         pinned = pin_id(str(_st.get("pinned") or ""))
@@ -3877,6 +4178,9 @@ def main() -> int:
         if row is None:
             raise SystemExit(f"--diagnose {args.diagnose}: no such credential "
                              f"(have: {', '.join(store.name(r) for r in store.rows)})")
+        if store.disabled(row):
+            raise SystemExit(f"--diagnose {args.diagnose}: it is disabled — never used, so not "
+                             f"tested either (clear its {DISABLED_COL} column first)")
         n_cli = 0 if args.no_cli else len(TIERS)
         print(f"diagnosing '{store.name(row)}' — {len(TIERS) + 1} API call(s)"
               + (f" and {n_cli} `claude -p` call(s)" if n_cli else "") + ", please wait…\n")
@@ -3928,6 +4232,92 @@ def main() -> int:
     try:
         with Keys(mouse=live_tty and args.mouse) as keys:
             hits: dict = {}
+            cursor = ""                        # the selected row, by token: survives a re-sort
+            view, detail_tok, set_sel = "table", "", 0   # which panel is on screen
+
+            def apply_setting(key: str, text: str) -> str:
+                """Change one setting now and save it to .env. Returns the line to flash."""
+                nonlocal interval, due, mode, sort, desc, color, title_on, auto_rotate, burn_on
+                nonlocal notify_ok
+                global LIMIT_5H, LIMIT_7D, ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING
+                global BURN_WINDOW, BURN_IDLE, BURN_MIN, NIGHT_FROM, NIGHT_UNTIL
+                global REBALANCE_IDLE, MIN_HEADROOM, HOLIDAYS_PATH
+                try:
+                    val = convert_setting(key, text)
+                except ConfigError as exc:
+                    return f"not changed: {exc}"
+                dest = key[len("CTR_"):].lower()
+                setattr(args, dest, val)
+                live_ = SETTINGS[key][4]
+                if dest == "limit_5h":
+                    LIMIT_5H = max(1.0, min(101.0, val))
+                elif dest == "limit_7d":
+                    LIMIT_7D = max(1.0, min(101.0, val))
+                elif dest == "rotate_gap":
+                    ROTATE_GAP = max(0.0, val)
+                elif dest == "reset_tie":
+                    RESET_TIE = max(0.0, val) * 60
+                elif dest == "pin_grace":
+                    PIN_GRACE = max(0.0, val) * 60
+                elif dest == "pin_ceiling":
+                    PIN_CEILING = max(1.0, min(101.0, val))
+                elif dest == "burn_window":
+                    BURN_WINDOW = max(1.0, val) * 60
+                elif dest == "burn_idle":
+                    BURN_IDLE = max(0.0, val) * 60
+                elif dest == "burn_min":
+                    BURN_MIN = max(0.0, val) * 60
+                elif dest == "night_from":
+                    NIGHT_FROM = max(0.0, min(24.0, val))
+                elif dest == "night_until":
+                    NIGHT_UNTIL = max(0.0, min(24.0, val))
+                elif dest == "rebalance_idle":
+                    REBALANCE_IDLE = max(0.0, val) * 60
+                elif dest == "min_headroom":
+                    MIN_HEADROOM = max(0.0, min(100.0, val))
+                elif dest == "holidays":
+                    HOLIDAYS_PATH = val
+                elif dest == "interval":
+                    interval = min(3600, max(5, int(val)))
+                    due = last + interval
+                elif dest == "view":
+                    mode = val
+                elif dest == "sort":
+                    sort, desc = val, val in SORT_DESC
+                elif dest == "color":
+                    color = bool(val) and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+                elif dest == "title":
+                    title_on = live_tty and bool(val)
+                elif dest == "mouse":
+                    keys.mouse = bool(val) and keys.unix and sys.stdout.isatty()
+                    sys.stdout.write(MOUSE_ON if keys.mouse else MOUSE_OFF)
+                elif dest == "notify":
+                    notify_ok = bool(val)
+                elif dest == "burn":
+                    burn_on = bool(val)
+                elif dest == "rotate_mode" and val:
+                    auto_rotate = str(val)
+                    st_ = load_state()
+                    st_["rotate_mode"] = auto_rotate
+                    save_state(st_)
+                    read_live()
+                try:
+                    write_env_value(ENV_PATH, key, text)
+                except OSError as exc:
+                    return f"{SETTINGS[key][1]} → {text or 'default'} for this run; .env not saved: {exc}"
+                if sources.get(key) in ("flag", "env"):
+                    note = " · a flag or CTR_ in the environment still wins on the next start"
+                else:
+                    note = ""
+                    sources[key] = ".env"
+                return (f"{SETTINGS[key][1]} → {setting_text(key, val) or 'default'} · saved to "
+                        f".env" + ("" if live_ else " · applies on the next start") + note)
+
+            def setting_values() -> dict[str, str]:
+                out_ = {k_: setting_text(k_, getattr(args, k_[len("CTR_"):].lower(), ""))
+                        for k_ in SETTINGS}
+                out_["CTR_ROTATE_MODE"] = auto_rotate
+                return out_
             if live_tty and os.name != "nt":
                 hold_terminal(keys, title_on)
             while True:
@@ -3935,7 +4325,7 @@ def main() -> int:
                 if time.time() >= due:
                     results = refresh()
                     swept = True
-                    probes += len(store.rows)
+                    probes += sum(1 for r in store.rows if not store.disabled(r))
                     last, due = time.time(), time.time() + interval
                     if burning:
                         # A hold ends at its reset or when off hours do; with a long interval the
@@ -3957,6 +4347,8 @@ def main() -> int:
                                 alerted.discard(tok)
 
                 rows = sort_rows(store, store.rows, results, sort, desc)
+                if cursor and cursor not in {store.token(r_) for r_ in rows}:
+                    cursor = ""
                 if swept:
                     was = str(LIVE.get("token") or "")
                     swap = auto_swap(results, rows)
@@ -3973,24 +4365,154 @@ def main() -> int:
                         sys.stdout.write(TITLE_SET.format(t))
                         last_title = t
                 size = shutil.get_terminal_size((110, 24))
-                frame = render(store, rows, results, hist, mode=mode, sort=sort,
-                               interval=interval, last=last, probes=probes, flash=flash,
-                               color=color, cols=size.columns,
-                               live=True, alert=args.alert, inspect=inspect, diag=diag,
-                               events=events, desc=desc, hits=hits)
+                wide = max(60, size.columns - 1)
+                if view == "detail" and detail_tok not in {store.token(r_) for r_ in rows}:
+                    view = "table"
+                if view == "detail":
+                    drow = next(r_ for r_ in rows if store.token(r_) == detail_tok)
+                    frame = screen(f"{store.name(drow)} · DETAILS",
+                                   detail_lines(store, drow, results.get(detail_tok, {}), still,
+                                                pinned, burning, color),
+                                   wide, size.lines, color, right=time.strftime("%H:%M:%S"),
+                                   hint="↑↓ other credential · ← / Esc back · p pin · n disable"
+                                        + (f" · {flash}" if flash else ""))
+                elif view == "diag" and diag:
+                    drow = next((r_ for r_ in rows if store.token(r_) == diag[0]), None)
+                    frame = screen("DIAGNOSE · which paths still work",
+                                   diagnose_lines(store.name(drow) if drow else "?", diag[1], color),
+                                   wide, size.lines, color, hint="← / Esc back")
+                elif view == "settings":
+                    sl = settings_lines(setting_values(), set_sel, color, sources, wide)
+                    at_sel = next((k_ for k_, ln in enumerate(sl) if ln.startswith(CURSOR_BG)
+                                   or ln.startswith("›")), 0)
+                    room = max(3, size.lines - 4)
+                    top = max(0, min(at_sel - room // 2, len(sl) - room))
+                    frame = screen("SETTINGS", sl, wide, size.lines, color, top=top,
+                                   right="saved to .env · applies at once",
+                                   hint="↑↓ move · ⏎ / Space change · ← → adjust · Esc back"
+                                        + (f"  ▸ {flash}" if flash else ""))
+                elif view == "help":
+                    frame = screen("KEYS", help_lines(color), wide, size.lines, color,
+                                   hint="Esc back")
+                else:
+                    view = "table"
+                    frame = render(store, rows, results, hist, mode=mode, sort=sort,
+                                   interval=interval, last=last, probes=probes, flash=flash,
+                                   color=color, cols=size.columns,
+                                   live=True, alert=args.alert, inspect=None, diag=None,
+                                   events=events, desc=desc, hits=hits, cursor=cursor)
                 sys.stdout.write((HOME if live_tty else "\n") + frame + "\n")
                 sys.stdout.flush()
-                hits["row"] = header_row(hits.get("line", -1), frame, size.lines, size.columns)
+                if view == "table":
+                    hits["row"] = header_row(hits.get("line", -1), frame, size.lines, size.columns)
+                else:
+                    hits["row"] = -1               # no clicks land on a panel
 
                 key = keys.get(min(1.0, max(0.2, due - time.time())) if due > time.time() else 0.2)
                 if not key:
                     continue
+                if key in ("\x03", "\x04"):
+                    break
+                toks = [store.token(r_) for r_ in rows]
+                UP, DOWN = ("\x1b[A", "\x1bOA", "k"), ("\x1b[B", "\x1bOB", "j")
+                LEFT, RIGHT = ("\x1b[D", "\x1bOD"), ("\x1b[C", "\x1bOC")
+                ENTER = ("\r", "\n")
+                if view == "settings":
+                    skeys = list(SETTINGS)
+                    k_ = skeys[set_sel]
+                    kind = next(kd for kk, kd, _ in CONFIG if kk == k_)
+                    cur_txt = setting_values()[k_]
+                    if key in ("\x1b", "q", "Q", ","):
+                        view, flash = "table", ""
+                    elif key in UP:
+                        set_sel = max(0, set_sel - 1)
+                    elif key in DOWN:
+                        set_sel = min(len(skeys) - 1, set_sel + 1)
+                    elif key in ("\x1b[H", "\x1b[1~", "\x1bOH"):
+                        set_sel = 0
+                    elif key in ("\x1b[F", "\x1b[4~", "\x1bOF"):
+                        set_sel = len(skeys) - 1
+                    elif lock is None:
+                        flash = "another dashboard writes here — change settings there"
+                    elif kind == "bool" and key in ENTER + (" ",) + LEFT + RIGHT:
+                        flash = apply_setting(k_, "false" if cur_txt == "true" else "true")
+                    elif isinstance(kind, tuple) and key in ENTER + (" ",) + LEFT + RIGHT:
+                        opts = [o for o in kind if o]
+                        at_o = opts.index(cur_txt) if cur_txt in opts else -1
+                        nxt = opts[(at_o + (-1 if key in LEFT else 1)) % len(opts)]
+                        flash = apply_setting(k_, nxt)
+                    elif kind in ("int", "float", "float?") and key in LEFT + RIGHT:
+                        step = SETTINGS[k_][3] or 1
+                        base = float(cur_txt) if cur_txt not in ("", "—") else 0.0
+                        newv = max(0.0, base + (step if key in RIGHT else -step))
+                        flash = apply_setting(k_, f"{newv:g}")
+                    elif key in ENTER + (" ",):
+                        ans = ask(keys, f"\n  {SETTINGS[k_][1]} [{cur_txt or 'default'}] — new "
+                                        f"value, blank keeps it, '-' resets to the default: ")
+                        if ans == "-":
+                            flash = apply_setting(k_, "")
+                        elif ans:
+                            flash = apply_setting(k_, ans)
+                    continue
+                if view == "detail":
+                    if key in ("\x1b", "q", "Q", "i") + LEFT + ENTER:
+                        view = "table"
+                    elif key in UP + DOWN and detail_tok in toks:
+                        at_d = toks.index(detail_tok) + (-1 if key in UP else 1)
+                        detail_tok = toks[max(0, min(len(toks) - 1, at_d))]
+                        cursor = detail_tok
+                    elif key in ("p", "n"):
+                        cursor, view = detail_tok, "table"   # act on it from the table below
+                    else:
+                        continue
+                    if key not in ("p", "n"):
+                        continue
+                elif view in ("diag", "help"):
+                    if key in ("\x1b", "q", "Q", "?", "D") + LEFT + ENTER:
+                        view = "table"
+                    continue
+                if key in ENTER or key == "i":
+                    target = cursor or str(LIVE.get("token") or "") or (toks[0] if toks else "")
+                    if target in toks:
+                        detail_tok, cursor, view, flash = target, target, "detail", ""
+                    continue
+                if key == ",":
+                    view, flash = "settings", ""
+                    continue
+                if key == "?":
+                    view, flash = "help", ""
+                    continue
+                move = {"\x1b[A": -1, "\x1bOA": -1, "k": -1, "\x1b[B": 1, "\x1bOB": 1, "j": 1,
+                        "\x1b[5~": -5, "\x1b[6~": 5,
+                        "\x1b[H": -999, "\x1bOH": -999, "\x1b[1~": -999,
+                        "\x1b[F": 999, "\x1bOF": 999, "\x1b[4~": 999}.get(key)
+                if move is not None and toks:
+                    # The cursor starts on the live credential (else the first row), then moves.
+                    if cursor in toks:
+                        at_ = toks.index(cursor) + move
+                    else:
+                        live_t = str(LIVE.get("token") or "")
+                        at_ = toks.index(live_t) if live_t in toks else 0
+                    cursor = toks[max(0, min(len(toks) - 1, at_))]
+                    flash = (f"selected '{token_name(store, cursor)}' — ⏎ details · p pin · "
+                             f"n disable · c copy · e edit · d delete · Esc clears")
+                    continue
+                if key == "\x1b":
+                    if cursor:
+                        cursor, flash = "", ""
+                    continue
                 if key.startswith("\x1b"):
-                    # Arrows, function keys and anything but a click on a header do nothing, and
-                    # leave the flash where it was.
+                    # A click on a header sorts by it; a click on a row selects it. Function keys
+                    # and the rest do nothing, and leave the flash where it was.
                     pos = mouse_click(key)
                     order = header_order(hits, pos) if pos else None
                     if order is None:
+                        if pos and hits.get("row", 0) > 0:
+                            k_ = pos[1] - (hits["row"] + 2)   # header, rule, then the rows
+                            if 0 <= k_ < len(hits.get("rows", [])):
+                                cursor = hits["rows"][k_]
+                                flash = (f"selected '{token_name(store, cursor)}' — p pin · "
+                                         f"n disable · c copy · Esc clears")
                         continue
                     desc = (not desc) if order == sort else order in SORT_DESC
                     sort = order
@@ -4015,17 +4537,11 @@ def main() -> int:
                     interval = max(5, interval // 2)
                     due = last + interval
                     flash = f"interval {interval}s"
-                elif key == "i":
-                    if inspect:
-                        inspect = None
-                    else:
-                        i = pick_row(keys, store, rows, "inspect")
-                        inspect = store.token(rows[i]) if i >= 0 else None
                 elif key == "D":
-                    if diag:
-                        diag = None
+                    if diag and diag[0] == cursor:
+                        view = "diag"                      # the last result, without re-spending
                         continue
-                    i = pick_row(keys, store, rows, "diagnose")
+                    i = pick_row(keys, store, rows, "diagnose", cursor)
                     if i < 0:
                         flash = "diagnose cancelled"
                         continue
@@ -4039,6 +4555,7 @@ def main() -> int:
                     sys.stdout.flush()
                     diag = (store.token(row), diagnose(store.token(row), args.timeout))
                     flash = f"diagnosed '{store.name(row)}'"
+                    view = "diag"
                     due = 0.0
                 elif key == "x":
                     via = copy_to_clipboard(markdown(store, rows, results))
@@ -4057,7 +4574,7 @@ def main() -> int:
                     # A single keypress only reaches row 9. Past that the row number has to be
                     # typed, so `c` asks for it — the list is not capped at nine credentials.
                     if key == "c":
-                        i = pick_row(keys, store, rows, "copy")
+                        i = pick_row(keys, store, rows, "copy", cursor)
                         if i < 0:
                             flash = "copy cancelled"
                             continue
@@ -4083,8 +4600,10 @@ def main() -> int:
                         flash = ("another dashboard writes here — this one only watches"
                                  if lock is None else "--no-env-write: the shell file is read-only")
                         continue
-                    ans = ask(keys, f"\n  pin — row number (1-{len(rows)}), blank for the "
-                                    f"freshest, 'c' to cancel: ")
+                    at_c = next((k for k, r_ in enumerate(rows) if cursor and store.token(r_) == cursor), -1)
+                    ans = str(at_c + 1) if at_c >= 0 else ask(
+                        keys, f"\n  pin — row number (1-{len(rows)}), blank for the freshest, "
+                              f"'c' to cancel: ")
                     if ans.lower().startswith("c"):
                         flash = "pin cancelled"
                         continue
@@ -4094,6 +4613,9 @@ def main() -> int:
                             flash = f"no row {ans}"
                             continue
                         row = rows[i]
+                        if store.disabled(row):
+                            flash = f"'{store.name(row)}' is disabled — n enables it first"
+                            continue
                         p5 = upct(results.get(store.token(row), {}), "u5h")
                     else:
                         pick = rotate_pick(store, rows, results)
@@ -4178,7 +4700,44 @@ def main() -> int:
                                  if pin_id(store.token(r)) == had), None) if had else None
                     flash = (f"unpinned '{name or 'credential'}' — auto-rotate and the spend-down "
                              f"rule may move it now" if had else "nothing is pinned")
+                elif key == "n":
+                    # Disabled means never used: not probed, not picked by any rule, moved off at
+                    # once if live. Kept in the CSV so it survives a restart.
+                    if store.readonly:
+                        flash = "list is read-only (--from-env)"
+                        continue
+                    if lock is None:
+                        flash = "another dashboard writes here — press n there"
+                        continue
+                    i = pick_row(keys, store, rows, "disable / enable", cursor)
+                    if i < 0:
+                        flash = "cancelled"
+                        continue
+                    row = rows[i]
+                    on = not store.disabled(row)
+                    store.set_disabled(row, on)
+                    try:
+                        saved = store.save()
+                    except (RuntimeError, OSError) as exc:
+                        store.set_disabled(row, not on)
+                        flash = f"not changed: {exc}"
+                        continue
+                    tok_n = store.token(row)
+                    results[tok_n] = dict(DISABLED_R) if on else {}
+                    flash = f"{'disabled' if on else 'enabled'} '{store.name(row)}' — {saved}"
+                    if on and LIVE.get("token") == tok_n:
+                        flash += (" · it is live: auto-rotate moves off it now"
+                                  if auto_rotate == "on" else
+                                  " · it is still live — p another credential (auto-rotate is "
+                                  f"{auto_rotate})")
+                    due = 0.0                          # refresh now, so the change shows at once
                 elif key == "z":
+                    rec = str(LIVE.get("token") or "")
+                    rec_row = next((r_ for r_ in store.rows if store.token(r_) == rec), None)
+                    if not LIVE.get("active") and rec_row is not None and store.disabled(rec_row):
+                        flash = (f"'{store.name(rec_row)}' is disabled — p another credential, "
+                                 f"or n to enable it")
+                        continue
                     if not env_ok:
                         flash = ("another dashboard writes here — this one only watches"
                                  if lock is None else "--no-env-write: the shell file is read-only")
@@ -4222,7 +4781,7 @@ def main() -> int:
                     if store.readonly:
                         flash = "list is read-only (--from-env)"
                         continue
-                    i = pick_row(keys, store, rows, "delete")
+                    i = pick_row(keys, store, rows, "delete", cursor)
                     if i < 0:
                         flash = "delete cancelled"
                         continue
@@ -4246,7 +4805,7 @@ def main() -> int:
                     if store.readonly:
                         flash = "list is read-only (--from-env)"
                         continue
-                    i = pick_row(keys, store, rows, "edit")
+                    i = pick_row(keys, store, rows, "edit", cursor)
                     if i < 0:
                         flash = "edit cancelled"
                         continue
