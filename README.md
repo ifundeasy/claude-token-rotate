@@ -89,12 +89,21 @@ cp .env.example .env
 
 ### Keys
 
+One line of keys sits under the table; `?` shows them all. Details, diagnosis, settings and
+the key list each take the whole screen — nothing stacks under the table — and `Esc` (or `←`)
+goes back.
+
 | | |
 |---|---|
+| `↑` `↓` (`j` `k`, `Home` `End`, click a row) · `Esc` | select a row — highlighted — and `p` `n` `c` `e` `d` `D` act on it without asking for a row number · clear the selection |
+| `⏎` (or `i`) | **details** of the selected credential: live / pinned / disabled, both windows with their resets, its idle clock, and the raw headers. `↑` `↓` step to the next credential, `←` / `Esc` back |
+| `,` | **settings**: every `.env` key, grouped. `↑` `↓` move, `⏎` / `Space` toggle or edit, `←` `→` step a number or cycle a choice. A change **applies at once** and is saved to `.env` in place (comments kept); the few that need a restart (file paths, write modes, `CTR_ONLY`, the cap) say so. A key also set by a flag or exported `CTR_` is marked, since that still wins on the next start |
+| `?` | all keys |
 | `h` `w` `o` `b` | view 5h / 7d / extra credits / all |
-| `r` `s` `i` `D` | refresh · cycle sort · raw headers · diagnose one credential |
+| `r` `s` `D` | refresh · cycle sort · diagnose one credential (its own screen) |
 | `1-9` `10`… `c` `f` `x` | copy that row's token (type two digits for row 10 and up) · copy any row by number · copy the freshest · copy the table as Markdown |
 | `a` `d` `e` | add · delete · edit a credential (name and/or token) |
+| `n` | disable / enable a credential: a disabled one is **never used at all** — never probed, never picked by auto-rotate, rebalance, the spend-down or `f`, refused by `p`, and moved off at once if it is live (even pinned). Stored as a `Disabled` column (`yes`) in `token.csv`, which you can also edit by hand |
 | **`p`** **`z`** **`T`** | **pin a token live for Claude Code (`t`, the old key, still works) · switch to your /login and back · auto-swap off/park/on** |
 | `u` | lift the pin `p` made — until then auto-rotate keeps its hands off it and no spend-down starts |
 | `+` `-` `q` | interval · quit |
@@ -137,6 +146,13 @@ trigger     the live credential is not usable, and 15s have passed since the las
 choose      among the usable ones, the soonest weekly reset;
             weekly resets under 1h apart: the soonest 5h reset
 ```
+
+**In off hours the 5h limit is lifted** (`CTR_OFF_LIFT_5H`, on by default). On a weekend, a
+national holiday, or any night from 22:00 to 07:00 — consecutive days off run together, so a
+two-day holiday is one stretch from 22:00 the evening before to 07:00 the morning after — a
+credential stays live until its 5h window is actually spent, and a replacement only needs 5h
+left. The weekly limit (66) still applies. Back in working hours the 5h limit returns, and a live
+credential past it moves on as usual. The footer says when the lift is in force.
 
 **Both windows decide.** A credential at 4% of its five hours and 96% of its week is fresh by the
 five-hour number alone and refused on the next request, so each window is checked on its own. The
@@ -569,7 +585,7 @@ where it came from — a typo cannot silently do nothing. Relative paths are tak
 | `CTR_INTERVAL` | `--interval SEC` | `60` | seconds between refreshes |
 | `CTR_TIMEOUT` | `--timeout SEC` | `30` | per-probe HTTP timeout |
 | `CTR_VIEW` | `--view b\|h\|w\|o` | `b` | starting view |
-| `CTR_SORT` | `--sort csv\|5h\|7d\|ov\|name\|r5h\|r7d` | `csv` | starting order (`r5h`/`r7d`: soonest reset first) |
+| `CTR_SORT` | `--sort csv\|5h\|7d\|ov\|name\|r5h\|r7d` | `r7d` | starting order — by default the week that resets first is on top (`r5h`/`r7d`: soonest reset first) |
 | `CTR_ALERT` | `--alert PCT` | off | ring the bell when a window crosses this |
 | `CTR_CAP` | `--cap USD\|auto\|off` | `auto` | extra-credit cap; `auto` reads it from `/api/oauth/usage` |
 | `CTR_COLOR` | `--[no-]color` | `true` | ANSI colour |
@@ -579,6 +595,7 @@ where it came from — a typo cannot silently do nothing. Relative paths are tak
 | `CTR_ROTATE_MODE` | `--rotate-mode off\|park\|on` | last `T` | what auto-rotate may do (`--auto-rotate` = `on`) |
 | `CTR_LIMIT_5H` | `--limit-5h PCT` | `61` | usable while 5h is below this (at most 60%) |
 | `CTR_LIMIT_7D` | `--limit-7d PCT` | `66` | usable while weekly is below this (at most 65%) |
+| `CTR_OFF_LIFT_5H` | `--[no-]off-lift-5h` | `true` | in off hours (weekends, holidays, nights 22:00–07:00) the 5h limit is lifted — used until 5h is spent; weekly still holds |
 | `CTR_ROTATE_GAP` | `--rotate-gap SEC` | `15` | least time between two automatic swaps |
 | `CTR_RESET_TIE` | `--reset-tie MIN` | `60` | weekly resets this close tie, and the 5h reset decides |
 | `CTR_PIN_GRACE` | `--pin-grace MIN` | `60` | the live credential (pinned or not) over 5h is kept when 5h resets within this… |
