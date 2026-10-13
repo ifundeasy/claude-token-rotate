@@ -1291,6 +1291,226 @@ def test_off_hours_lift_5h(d: str) -> None:
         m.OFF_FORCE, m.OFF_LIFT_5H = saved
 
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _files(d: str) -> dict[str, str]:
+    """A credential list, shell file, credentials file and holidays for a daemon in `d`."""
+    os.makedirs(d, exist_ok=True)
+    f = {k: os.path.join(d, n) for k, n in (("csv", "token.csv"), ("env", "zshenv"),
+                                              ("creds", "creds.json"), ("hol", "holidays.txt"))}
+    with open(f["csv"], "w") as fh:
+        fh.write(f"Name,CLAUDE_CODE_OAUTH_TOKEN\nalpha,{tok('A')}\nbeta,{tok('B')}\ngamma,{tok('C')}\n")
+    with open(f["env"], "w") as fh:
+        fh.write(f'export CLAUDE_CODE_OAUTH_TOKEN="{tok("A")}"\n')
+    with open(f["creds"], "w") as fh:
+        json.dump({"claudeAiOauth": {"accessToken": tok("A"), "refreshToken": "",
+                                     "expiresAt": None, "scopes": []}}, fh)
+    with open(f["creds"] + ".claude_token_rotate.login", "w") as fh:
+        json.dump({"claudeAiOauth": {"accessToken": "login", "refreshToken": "r",
+                                     "expiresAt": None, "scopes": []}}, fh)
+    open(f["hol"], "w").close()
+    return f
+
+
+def _daemon(d: str, *extra: str, slow: float = 0.0) -> "subprocess.Popen":
+    """The real `daemon` in a child process, with probes faked and every path inside `d`."""
+    f = _files(d) if not os.path.exists(os.path.join(d, "token.csv")) else \
+        {k: os.path.join(d, n) for k, n in (("csv", "token.csv"), ("env", "zshenv"),
+                                              ("creds", "creds.json"), ("hol", "holidays.txt"))}
+    code = f"""
+import sys, os
+sys.path.insert(0, {REPO!r})
+os.environ["XDG_RUNTIME_DIR"] = {d!r}
+import main as m
+m.STATE_PATH = os.path.join({d!r}, "data.json")
+m.ENV_PATH = os.path.join({d!r}, ".env")
+m.app_dir = lambda: {d!r}
+ok = {{"u5h": "0.10", "u7d": "0.20", "r5h": "2000000000", "r7d": "2000000000",
+       "s5h": "allowed", "s7d": "allowed", "ok": True, "code": 200}}
+import time as _t
+def _probe_all(store, toks, t):
+    _t.sleep({slow!r})
+    return {{k: dict(ok) for k in toks}}
+m.probe_all = _probe_all
+m.probe = lambda tok, t: dict(ok)
+m.refresh_pool = lambda t: None
+m.resolve_cap = lambda *a, **k: None
+m.sessions_on = lambda t: []
+m.notify = lambda *a, **k: False
+m.diagnose = lambda tok, t, **k: {{"sdk": {{}}, "cli": {{}}}}
+m.DAEMON_POLL = 0.05
+sys.argv = ["main.py", "daemon", "--csv", {f["csv"]!r}, "--env-file", {f["env"]!r},
+            "--creds-file", {f["creds"]!r}, "--holidays", {f["hol"]!r}, "--cap", "off",
+            "--rotate-mode", "on", "--no-notify"] + {list(extra)!r}
+sys.exit(m.main())
+"""
+    return subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, env={**os.environ, "CTR_SOCKET": ""})
+
+
+def _wait_up(r: "m.Remote", secs: float = 15.0) -> bool:
+    end = time.time() + secs
+    while time.time() < end:
+        if r.call("hello").get("ok"):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_daemon_protocol(d: str) -> None:
+    """The daemon and its screens: the protocol, what it refuses, and how it fails."""
+    import socket as _socket
+    import threading as _th
+    dd = os.path.join(d, "daemon")
+    sock = os.path.join(dd, "claude-token-rotate.sock")
+    p1 = _daemon(dd)
+    r = m.Remote(sock)
+    try:
+        check("daemon: answers hello", _wait_up(r))
+        hello = r.call("hello")
+        check("daemon: speaks protocol 1 and says its version",
+              hello.get("proto") == m.PROTO and hello.get("version") == m.VERSION)
+        check("daemon: the socket is 0600", (os.stat(sock).st_mode & 0o777) == 0o600)
+        time.sleep(0.3)
+        snap = r.call("snapshot")
+        check("snapshot: rows by id, with name and tail",
+              [x["name"] for x in snap.get("rows", [])] == ["alpha", "beta", "gamma"]
+              and snap["rows"][1]["tail"] == tok("B")[-8:])
+        check("snapshot: never a token in it", "sk-ant-" not in json.dumps(snap))
+        ids = [x["id"] for x in snap["rows"]]
+
+        raw = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        raw.connect(sock)
+        raw.sendall(b"not json\n")
+        bad = json.loads(raw.makefile().readline())
+        raw.sendall(b'{"v": 1, "id": 7, "cmd": "hello"}\n')
+        again = json.loads(raw.makefile().readline())
+        raw.close()
+        check("protocol: a bad line is answered, and the connection lives on",
+              bad.get("ok") is False and again.get("ok") and again.get("id") == 7)
+        raw = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        raw.connect(sock)
+        raw.sendall(b'{"cmd": "' + b"x" * 70000 + b'"}\n')
+        big = json.loads(raw.makefile().readline())
+        raw.close()
+        check("protocol: a line over 64 KiB is refused", big.get("ok") is False)
+        check("protocol: an unknown command is refused", r.call("nope").get("ok") is False)
+
+        res = r.call("pin", id=ids[1])
+        with open(os.path.join(dd, "creds.json")) as fh:
+            live = json.load(fh)["claudeAiOauth"]["accessToken"]
+        check("pin: the daemon writes the credentials file", res.get("ok") and live == tok("B"))
+        check("token: the one answer that carries a token",
+              r.call("token", id=ids[2]).get("token") == tok("C"))
+        check("disable: saved to the CSV", r.call("disable", id=ids[2]).get("ok")
+              and "yes" in open(os.path.join(dd, "token.csv")).read())
+        res = r.call("set", key="CTR_LIMIT_5H", value="55")
+        check("set: applied and saved to .env", res.get("ok")
+              and "CTR_LIMIT_5H=55" in open(os.path.join(dd, ".env")).read()
+              and r.call("snapshot")["globals"]["LIMIT_5H"] == 55.0)
+        check("diagnose: starts in the background", r.call("diagnose", id=ids[0]).get("ok"))
+        time.sleep(0.5)
+        check("diagnose: its result shows in the snapshot",
+              (r.call("snapshot")["diags"].get(ids[0]) or {}).get("result") is not None)
+
+        p2 = _daemon(dd)
+        out2 = p2.communicate(timeout=20)
+        check("a second daemon refuses to start", p2.returncode == 1)
+
+        errs: list = []
+
+        def hammer() -> None:
+            rr = m.Remote(sock)
+            for _ in range(20):
+                if not rr.call("snapshot").get("ok"):
+                    errs.append(1)
+            rr.close()
+        ts = [_th.Thread(target=hammer) for _ in range(10)]
+        for t_ in ts:
+            t_.start()
+        for t_ in ts:
+            t_.join()
+        check("10 screens at once, 200 snapshots, none lost", not errs)
+
+        p1.kill()
+        p1.wait()
+        check("daemon gone: a screen gets an answer, not an exception",
+              r.call("snapshot").get("ok") is False)
+        check("its socket is left behind (stale)", os.path.exists(sock))
+        p1 = _daemon(dd)
+        check("a new daemon clears the stale socket, and the same screen reconnects",
+              _wait_up(r))
+        check("state survives the restart (the pin)", r.call("snapshot").get("pinned") == ids[1])
+    finally:
+        r.close()
+        p1.kill()
+        p1.wait()
+
+    dr = os.path.join(d, "dry")
+    _files(dr)
+    before = open(os.path.join(dr, "creds.json")).read()
+    p3 = _daemon(dr, "--dry-run")
+    r3 = m.Remote(os.path.join(dr, "claude-token-rotate.sock"))
+    try:
+        check("dry run: answers", _wait_up(r3))
+        time.sleep(0.3)
+        ids = [x["id"] for x in r3.call("snapshot")["rows"]]
+        check("dry run: refuses every change", r3.call("pin", id=ids[1]).get("ok") is False)
+        check("dry run: wrote no credentials file and no data.json",
+              open(os.path.join(dr, "creds.json")).read() == before
+              and not os.path.exists(os.path.join(dr, "data.json")))
+        check("dry run: logs every refresh to .cache/shadow",
+              bool(os.listdir(os.path.join(dr, ".cache", "shadow"))))
+    finally:
+        r3.close()
+        p3.kill()
+        p3.wait()
+    sl = os.path.join(d, "slow")
+    p4 = _daemon(sl, "--interval", "5", slow=3.0)
+    r4 = m.Remote(os.path.join(sl, "claude-token-rotate.sock"), timeout=1.0)
+    try:
+        check("slow sweeps: the daemon still comes up", _wait_up(r4, 20))
+        time.sleep(1.0)                                   # now inside a 3-second sweep
+        t0 = time.time()
+        ok_h, ok_s = r4.call("hello").get("ok"), r4.call("snapshot").get("ok")
+        check("slow sweeps: hello and snapshot answer at once, mid-sweep",
+              ok_h and ok_s and time.time() - t0 < 1.0)
+        p5 = _daemon(sl, "--dry-run")
+        out5 = p5.communicate(timeout=20)
+        check("a dry run cannot take a busy daemon's socket",
+              p5.returncode == 1 and r4.call("hello").get("dry_run") is False)
+    finally:
+        r4.close()
+        p4.kill()
+        p4.wait()
+    fl = os.path.join(d, "file")
+    os.makedirs(fl, exist_ok=True)
+    precious = os.path.join(fl, "claude-token-rotate.sock")
+    with open(precious, "w") as fh:
+        fh.write("keep me")
+    p6 = _daemon(fl)
+    p6.communicate(timeout=20)
+    check("a regular file where the socket goes is refused, not deleted",
+          p6.returncode == 1 and open(precious).read() == "keep me")
+    bad = subprocess.run([sys.executable, os.path.join(REPO, "main.py"), "--dry-run", "--once"],
+                         capture_output=True, text=True, env={**os.environ, "CTR_SOCKET": ""})
+    check("--dry-run without daemon is an error, not a writing dashboard",
+          bad.returncode == 2 and "--dry-run" in bad.stderr)
+    a_, b_ = _socket.socketpair(_socket.AF_UNIX)
+    check("peer_uid: a Unix socket names the uid on the other end", m.peer_uid(a_) == os.getuid())
+    a_.close()
+    b_.close()
+    ww = os.path.join(d, "worldw")
+    os.makedirs(ww, exist_ok=True)
+    os.chmod(ww, 0o1777)                                  # like /tmp: sticky, writable by all
+    p7 = _daemon(ww)
+    p7.communicate(timeout=20)
+    check("a socket directory anyone may write to is refused, sticky or not", p7.returncode == 1)
+    check("no daemon: hello is a plain refusal (the dashboard runs standalone)",
+          m.Remote(os.path.join(d, "none.sock")).call("hello").get("ok") is False)
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
@@ -1301,7 +1521,7 @@ def main() -> int:
                    test_park_mode,
                    test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
                    test_file_mode, test_header_sort, test_burn_before_weekly_reset, test_holiday_file,
-                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle, test_idle_and_nights_hold, test_fewer_swaps, test_disabled_is_never_used, test_off_hours_lift_5h):
+                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle, test_idle_and_nights_hold, test_fewer_swaps, test_disabled_is_never_used, test_off_hours_lift_5h, test_daemon_protocol):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

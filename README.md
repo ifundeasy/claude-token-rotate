@@ -117,6 +117,35 @@ read as letters.
 
 ---
 
+## Daemon: one engine, any number of screens
+
+Rotation, spend-down and rebalance only run while something runs them. Install the daemon once
+and they run all the time, whether or not a dashboard is open:
+
+```bash
+claude-token-rotate install-service      # systemd user unit, started now and at every login
+claude-token-rotate status               # 0 healthy · 1 down · 2 stale
+journalctl --user -u claude-token-rotate -f
+claude-token-rotate uninstall-service    # back to standalone dashboards
+```
+
+With the daemon up, every `claude-token-rotate` you open — one shell or ten — is a **screen** of
+it: the same table, keys, panels and settings, but nothing is probed or written locally. Each key
+is sent to the daemon over a Unix socket (`$XDG_RUNTIME_DIR/claude-token-rotate.sock`, mode 0600,
+`CTR_SOCKET` to move it), and every screen shows the same state at once. A token never travels in
+the snapshot screens read; only copying one asks the daemon for it.
+
+Without a daemon, `claude-token-rotate` runs the engine itself, exactly as before (`--standalone`
+forces that even when a daemon is up). If the daemon goes away, its screens say so, write
+nothing, and reconnect when systemd has restarted it.
+
+`claude-token-rotate daemon --dry-run` decides everything but writes nothing — no credentials,
+shell file, CSV, `.env` or `data.json` — and logs each refresh to `.cache/shadow/<day>.jsonl`.
+Run it beside a dashboard, then `claude-token-rotate shadow-report [YYYY-MM-DD]` lists every
+refresh where the two would have chosen differently. That is how v2 was checked against v1.0.0.
+
+The protocol and the rules about who writes what are in [`docs/daemon.md`](docs/daemon.md).
+
 ## Token rotation
 
 One credential is the one Claude Code actually uses. The dashboard marks it **cyan** in the NAME
@@ -613,6 +642,7 @@ where it came from — a typo cannot silently do nothing. Relative paths are tak
 | `CTR_ENV_WRITE` | `--[no-]env-write` | `true` | write the shell file at all (false: `p`/`T`/`z` read-only) |
 | `CTR_CREDS_WRITE` | `--[no-]creds-write` | `true` | write the credentials file (false implies the export way) |
 | `CTR_EXPORT_ENV` | `--[no-]export-env` | `false` | also export the token from the shell file (a restart per swap) |
+| `CTR_SOCKET` | `--socket PATH` | `$XDG_RUNTIME_DIR/claude-token-rotate.sock` | where the daemon and its screens meet (0600) |
 
 One-off actions are flags only:
 
@@ -649,8 +679,14 @@ the clipboard.
 ## Tests
 
 ```bash
-python3 tests/run.py
+python3 tests/run.py                    # unit and protocol tests
+python3 tests/sim.py --golden           # nine scenarios on a fake clock vs v1.0.0's timelines
+python3 tests/sim.py --golden --daemon  # the same nine through the daemon and its socket
 ```
+
+`tests/sim.py` runs the real program in a pty on a fake clock, against a world model where quota
+moves only when somebody spends it, and records every refresh's decision. `tests/golden/` holds
+what v1.0.0 decided; any change in behaviour shows up as a diff.
 
 Standard library only, no framework. Every case builds its own CSV, shell rc and credentials file
 in a temp directory — nothing touches a real file. The statusline cases run the real script

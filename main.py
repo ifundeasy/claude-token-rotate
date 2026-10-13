@@ -179,11 +179,16 @@ import math
 import os
 import re
 import shutil
+import shlex
+import socket
+import socketserver
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -193,6 +198,16 @@ PROBE_MODEL = "claude-haiku-4-5"        # cheapest model that still returns the 
 API_VERSION = "2023-06-01"
 OAUTH_BETA = "oauth-2025-04-20"         # /v1/messages refuses an OAuth token without it
 UA = "claude-token-rotate/2.0"
+VERSION = "2.0.0"
+#: The client/daemon protocol. A client that speaks another one runs read-only and says so.
+PROTO = 1
+#: How long the daemon sleeps between looks at the clock, seconds.
+DAEMON_POLL = 1.0
+#: `daemon --dry-run`: decide and log, write nothing at all (credentials, shell file, CSV, .env,
+#: data.json, notifications). Set once at start; every writer checks it.
+DRY_RUN = False
+#: What a dry run would have made live this refresh, by name — logged to .cache/shadow/.
+DRY_WOULD: list[str] = []
 TOKEN_COL = "CLAUDE_CODE_OAUTH_TOKEN"
 NAME_COL = "Name"
 #: An optional column: a row marked yes / true / 1 / x is never used at all — never probed, never
@@ -412,6 +427,10 @@ class Store:
     def token(self, row: dict[str, str]) -> str:
         return (row.get(self.tok_col) or "").strip()
 
+    def tail(self, row: dict[str, str]) -> str:
+        """The last 8 characters a screen shows. A client's rows carry them from the daemon."""
+        return getattr(self, "tails", {}).get(self.token(row)) or self.token(row)[-8:]
+
     def _disabled_col(self) -> str | None:
         return next((c for c in self.fields if (c or "").lower() == DISABLED_COL.lower()), None)
 
@@ -434,6 +453,8 @@ class Store:
 
         Returns a short message for the status line. Raises RuntimeError when read-only.
         """
+        if DRY_RUN:
+            return "dry run: not saved"
         if self.readonly or not self.path:
             raise RuntimeError("credential list came from the environment — nothing to write")
         if os.path.exists(self.path):
@@ -773,6 +794,8 @@ def save_state(state: dict[str, object]) -> None:
     Token digests are not credentials, but the file names which accounts are being watched, so it
     is written owner-only like the CSV beside it.
     """
+    if DRY_RUN:
+        return
     tmp = f"{STATE_PATH}.{os.getpid()}.tmp"
     try:
         # Write beside it and rename over it: a reader never sees half a file.
@@ -1318,12 +1341,17 @@ def apply_live(env_path: str, creds_path: str, store: "Store", token: str,
                on: bool | None, file_mode: bool, creds_ok: bool = True) -> str:
     """Make `token` the live credential. `on` switches it on / off, `None` keeps the current state.
 
+    In a dry run nothing is written: the choice is noted for the shadow log instead.
+
     FILE MODE — the default — writes the shell file only as a RECORD, always switched off with its
     `unset`, so no process started from a shell ever inherits the variable; the credentials file
     carries the token instead, and is where on/off lives. That is the whole point: a session that
     inherited the variable ignores the file until it restarts, while one that did not picks up the
     file on its next request. Env mode (`--export-env`) exports the variable as well, as before.
     """
+    if DRY_RUN:
+        DRY_WOULD.append(token_name(store, token) or redact(token))
+        return f"dry run: would make {token_name(store, token) or redact(token)} live"
     if not file_mode:
         msg = env_set(env_path, store, token, activate=on)
         if creds_ok:
@@ -1338,6 +1366,9 @@ def apply_live(env_path: str, creds_path: str, store: "Store", token: str,
 def toggle_live(env_path: str, creds_path: str, store: "Store", file_mode: bool,
                 creds_ok: bool = True) -> tuple[str, bool]:
     """Switch the live credential off (back to the /login) or on (the recorded token)."""
+    if DRY_RUN:
+        DRY_WOULD.append("(z)")
+        return "dry run: would switch", False
     if not file_mode:
         msg, on = env_toggle(env_path)
         if creds_ok:
@@ -1411,11 +1442,13 @@ def sessions_on(token: str) -> list[tuple[int, str]]:
 
 
 def notify(title: str, body: str) -> bool:
-    """Best-effort desktop notification. Never raises, never blocks the draw loop.
+    """Best-effort desktop notification. Never raises, never blocks the draw loop. None in a dry run.
 
     Detached with Popen rather than run(): a notification daemon that hangs must not take the
     dashboard down with it, and there is nothing in the reply worth waiting for.
     """
+    if DRY_RUN:
+        return False
     exe = shutil.which("notify-send")
     if not exe:
         return False
@@ -2454,7 +2487,7 @@ def build_cols(mode: str, store: Store, rows: list[dict[str, str]], hist: dict, 
     def c_token(row, r):
         # Always "..." and the last 8 characters, at any width: the tail is what tells two
         # credentials apart, and a column that changes with the window is harder to scan.
-        return paint("..." + store.token(row)[-8:], DIM, color)
+        return paint("..." + store.tail(row), DIM, color)
 
     def util(field, ceil_fn=lambda r: 100.0, width=6):
         def fn(row, r):
@@ -3388,6 +3421,7 @@ CONFIG: tuple[tuple[str, object, object], ...] = (
     ("CTR_ENV_WRITE", "bool", True),
     ("CTR_CREDS_WRITE", "bool", True),
     ("CTR_EXPORT_ENV", "bool", False),
+    ("CTR_SOCKET", "path", ""),
 )
 _TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
 
@@ -3446,6 +3480,8 @@ SETTINGS: dict[str, tuple[str, str, str, float, bool, str]] = {
     "CTR_ENV_WRITE": ("Files", "Write shell file", "", 0, False, "false makes p / T / z read-only"),
     "CTR_CREDS_WRITE": ("Files", "Write credentials", "", 0, False, "false falls back to exporting"),
     "CTR_EXPORT_ENV": ("Files", "Export variable", "", 0, False, "the old way: a restart per swap"),
+    "CTR_SOCKET": ("Files", "Daemon socket", "", 0, False,
+                   "where daemon and clients meet (empty = $XDG_RUNTIME_DIR)"),
 }
 
 
@@ -3562,9 +3598,13 @@ def convert_setting(key: str, val: str, where: str = "") -> object:
 def write_env_value(path: str, key: str, raw: str) -> None:
     """Set KEY=raw in the .env file, in place: comments, order and every other line untouched.
 
+    Nothing in a dry run.
+
     A missing .env starts as a copy of .env.example beside it (or empty). A value with spaces or a
     `#` is quoted. Written atomically, owner-only.
     """
+    if DRY_RUN:
+        return
     try:
         with open(path, encoding="utf-8-sig") as fh:
             lines = fh.read().splitlines()
@@ -3588,6 +3628,176 @@ def write_env_value(path: str, key: str, raw: str) -> None:
         fh.write("\n".join(lines) + "\n")
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------- daemon and clients
+
+def socket_path(configured: str = "") -> str:
+    """Where the daemon listens: CTR_SOCKET, else $XDG_RUNTIME_DIR, else beside the binary."""
+    if configured:
+        return configured
+    run = os.environ.get("XDG_RUNTIME_DIR")
+    return os.path.join(run, "claude-token-rotate.sock") if run and os.path.isdir(run) \
+        else os.path.join(app_dir(), ".ctr.sock")
+
+
+def peer_uid(sock: socket.socket) -> int | None:
+    """The uid on the other end of a Unix socket (SO_PEERCRED), or None where it is unknown."""
+    try:
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        return struct.unpack("3i", raw)[1]
+    except (OSError, AttributeError, struct.error):
+        return None
+
+
+class Remote:
+    """A client's line to the daemon: one JSON request per line, one JSON answer per line.
+
+    Every call answers a dict with "ok" and "msg"; a daemon that is gone answers ok=False rather
+    than raising, and the next call tries to reconnect.
+    """
+
+    def __init__(self, path: str, timeout: float = 5.0) -> None:
+        self.path, self.timeout = path, timeout
+        self.sock: socket.socket | None = None
+        self.buf = b""
+        self.n = 0
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock, self.buf = None, b""
+
+    def call(self, cmd: str, **kw: object) -> dict:
+        # hello and snapshot are answered at once; a command may wait for a sweep in progress
+        # (probes time out at CTR_TIMEOUT), so it gets far longer before it counts as gone.
+        wait = self.timeout if cmd in ("hello", "snapshot") else max(self.timeout, 60.0)
+        for _ in range(2):
+            try:
+                if self.sock is None:
+                    # Only a daemon of this user: a socket squatted by someone else (in a shared
+                    # directory) would otherwise be sent every token an add or an edit carries.
+                    # The directory and the socket must be ours, and — what settles it, since
+                    # the path can change between a check and a connect — the process actually
+                    # on the other end must be this uid. Unknown counts as no.
+                    st_d = os.stat(os.path.dirname(self.path) or ".")
+                    if st_d.st_uid != os.getuid() or st_d.st_mode & 0o002 \
+                            or os.lstat(self.path).st_uid != os.getuid():
+                        return {"ok": False, "msg": f"{self.path} is not safely yours — "
+                                                    f"refusing it"}
+                    s_ = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s_.settimeout(self.timeout)
+                    s_.connect(self.path)
+                    if peer_uid(s_) != os.getuid():
+                        s_.close()
+                        return {"ok": False, "msg": "the process on that socket is not yours "
+                                                    "— refusing it"}
+                    self.sock = s_
+                self.sock.settimeout(wait)
+                self.n += 1
+                self.sock.sendall((json.dumps({"v": PROTO, "id": self.n, "cmd": cmd, **kw})
+                                   + "\n").encode())
+                while b"\n" not in self.buf:
+                    chunk = self.sock.recv(1 << 20)
+                    if not chunk:
+                        raise OSError("closed")
+                    self.buf += chunk
+                line, self.buf = self.buf.split(b"\n", 1)
+                out = json.loads(line)
+                return out if isinstance(out, dict) else {"ok": False, "msg": "bad answer"}
+            except (OSError, ValueError):
+                self.close()
+        return {"ok": False, "msg": "daemon not reachable"}
+
+
+def _tick_hook(now: float) -> None:
+    """Called by the daemon after every refresh. Nothing here; tests hook it to stay in step."""
+
+
+SERVICE = "claude-token-rotate.service"
+
+
+def service_unit() -> str:
+    exe = [sys.executable] if getattr(sys, "frozen", False) \
+        else [sys.executable, os.path.abspath(__file__)]
+    return ("[Unit]\nDescription=claude-token-rotate daemon — probes, rotates, writes\n\n"
+            "[Service]\nType=simple\n"
+            f"ExecStart={' '.join(shlex.quote(x) for x in exe + ['daemon'])}\n"
+            f"WorkingDirectory={app_dir()}\nRestart=on-failure\nRestartSec=5\n\n"
+            "[Install]\nWantedBy=default.target\n")
+
+
+def install_service(remove: bool = False) -> int:
+    """Write (or remove) the systemd user unit and start (or stop) it."""
+    unit = os.path.join(os.path.expanduser("~/.config/systemd/user"), SERVICE)
+    sc = (lambda *a: subprocess.run(["systemctl", "--user", *a], capture_output=True, text=True))
+    if remove:
+        sc("disable", "--now", SERVICE)
+        if os.path.exists(unit):
+            os.unlink(unit)
+        sc("daemon-reload")
+        print(f"removed {unit}; the daemon is stopped. Dashboards run standalone again.")
+        return 0
+    os.makedirs(os.path.dirname(unit), exist_ok=True)
+    with open(unit, "w", encoding="utf-8") as fh:
+        fh.write(service_unit())
+    for step in (("daemon-reload",), ("enable", "--now", SERVICE)):
+        r = sc(*step)
+        if r.returncode:
+            print(f"systemctl --user {' '.join(step)} failed: {r.stderr.strip()}", file=sys.stderr)
+            return 1
+    print(f"installed {unit} and started it.\n"
+          f"  status:  claude-token-rotate status\n"
+          f"  logs:    journalctl --user -u {SERVICE} -f\n"
+          f"  remove:  claude-token-rotate uninstall-service")
+    return 0
+
+
+def status_cmd(path: str) -> int:
+    """0 healthy, 1 down, 2 stale (no refresh in three intervals)."""
+    r = Remote(path)
+    hello = r.call("hello")
+    if not hello.get("ok"):
+        print(f"daemon: not running (no answer on {path})")
+        return 1
+    snap = r.call("snapshot")
+    last, iv = float(snap.get("last") or 0), float(snap.get("interval") or 60)
+    age = time.time() - last if last else float("inf")
+    live = snap.get("live") or {}
+    print(f"daemon: running · version {hello.get('version')} · pid {hello.get('pid')}"
+          + (" · DRY RUN" if hello.get("dry_run") else ""))
+    print(f"  last refresh: {span(age) + ' ago' if last else 'not yet'} (every {iv:.0f}s)")
+    print(f"  live: {live.get('name') or '—'}{'' if live.get('active') else ' (switched off)'}"
+          f" · auto-rotate {snap.get('auto')}")
+    print(f"  socket: {path}")
+    return 2 if age > 3 * iv else 0
+
+
+def shadow_report(day: str = "") -> int:
+    """Compare a `daemon --dry-run` log with what the running dashboard really did."""
+    day = day or datetime.date.today().isoformat()
+    path = os.path.join(app_dir(), ".cache", "shadow", f"{day}.jsonl")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            recs = [json.loads(x) for x in fh if x.strip()]
+    except (OSError, ValueError) as exc:
+        print(f"no shadow log for {day}: {exc}")
+        return 1
+    bad = 0
+    for a, b in zip(recs, recs[1:]):
+        want = a.get("would")[-1] if a.get("would") else None
+        before, after = a.get("live"), b.get("live")
+        if want and want != after:
+            bad += 1
+            print(f"  {a['t']}  would make {want} live; the dashboard has {after}")
+        elif not want and before != after:
+            bad += 1
+            print(f"  {a['t']}  the dashboard moved {before} → {after}; the daemon would not")
+    print(f"{day}: {len(recs)} refreshes, {bad} difference{'s' if bad != 1 else ''}")
+    return 1 if bad else 0
 
 
 # --------------------------------------------------------------------------- main
@@ -3730,6 +3940,21 @@ def main() -> int:
                     help="with --diagnose: skip the `claude -p` test (faster, no subscription cost)")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
     ap.add_argument("--json", action="store_true", help="with --once: JSON instead of a table")
+    ap.add_argument("cmd", nargs="?",
+                    choices=("daemon", "install-service", "uninstall-service", "status",
+                             "shadow-report"),
+                    help="daemon: the engine, headless · install-service / uninstall-service: run "
+                         "it as a systemd user service · status: is it healthy · shadow-report: "
+                         "compare a --dry-run log with what happened. Without one: a dashboard — "
+                         "a screen of the daemon when it runs, standalone otherwise")
+    ap.add_argument("day", nargs="?", help="with shadow-report: the day, YYYY-MM-DD (default today)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with daemon: decide and log to .cache/shadow/, write nothing at all")
+    ap.add_argument("--standalone", action="store_true",
+                    help="run the engine in this window even when a daemon is up (v1 behaviour)")
+    ap.add_argument("--socket", metavar="PATH",
+                    help="where the daemon and its screens meet · CTR_SOCKET "
+                         "(default $XDG_RUNTIME_DIR/claude-token-rotate.sock)")
     ap.set_defaults(**cfg)
     args = ap.parse_args()
     for _k, *_ in CONFIG:                        # a flag that differs from the config set it
@@ -3754,10 +3979,39 @@ def main() -> int:
         if getattr(args, k):
             setattr(args, k, os.path.expanduser(getattr(args, k)))
     HOLIDAYS_PATH = args.holidays
+    global DRY_RUN
+    if args.dry_run and args.cmd != "daemon":
+        ap.error("--dry-run goes with `daemon` only: a dashboard writes")
+    DRY_RUN = bool(args.dry_run)
+    if args.cmd == "install-service":
+        return install_service()
+    if args.cmd == "uninstall-service":
+        return install_service(remove=True)
+    if args.cmd == "status":
+        return status_cmd(socket_path(args.socket or ""))
+    if args.cmd == "shadow-report":
+        return shadow_report(args.day or "")
+    # A dashboard with a daemon up is one of its screens: it reads, the daemon writes.
+    client: Remote | None = None
+    if args.cmd is None and not (args.standalone or args.once or args.diagnose
+                                 or args.from_env is not None):
+        _r = Remote(socket_path(args.socket or ""), timeout=3.0)
+        _h = _r.call("hello")
+        if _h.get("ok") and _h.get("proto") == PROTO:
+            client = _r
+        elif _h.get("ok"):
+            print(f"the daemon speaks protocol {_h.get('proto')}, this dashboard {PROTO} — "
+                  f"restart it (systemctl --user restart {SERVICE}); running standalone",
+                  file=sys.stderr)
 
-    store = Store.from_env(args.from_env or None) if args.from_env is not None \
-        else Store.from_csv(args.csv)
-    if args.only:                            # narrows the view; the full list stays in store
+    if client is not None:
+        store = Store(None, [], [NAME_COL, TOKEN_COL, DISABLED_COL])
+        store.tok_col, store.name_col = TOKEN_COL, NAME_COL
+        store.tails = {}
+    else:
+        store = Store.from_env(args.from_env or None) if args.from_env is not None \
+            else Store.from_csv(args.csv)
+    if args.only and client is None:         # narrows the view; the full list stays in store
         want = {w.strip().lower() for w in args.only.split(",") if w.strip()}
         store.only(want)
         if not store.rows:
@@ -3772,10 +4026,12 @@ def main() -> int:
             explicit = float(cap_arg)
         except ValueError:
             raise SystemExit(f"--cap {args.cap}: expected a dollar amount, 'auto' or 'off'")
-    if cap_arg not in ("off", "none", "0") and sys.stderr.isatty():
-        print("reading /api/oauth/usage for the extra-credit cap …", file=sys.stderr, flush=True)
-    resolve_cap(explicit, [store.token(r) for r in store.rows if not store.disabled(r)],
-                args.timeout)
+    if client is None:
+        if cap_arg not in ("off", "none", "0") and sys.stderr.isatty():
+            print("reading /api/oauth/usage for the extra-credit cap …", file=sys.stderr,
+                  flush=True)
+        resolve_cap(explicit, [store.token(r) for r in store.rows if not store.disabled(r)],
+                    args.timeout)
     color = args.color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     interval, mode, sort = min(3600, max(5, args.interval)), args.view, args.sort
     desc = sort in SORT_DESC
@@ -3785,12 +4041,21 @@ def main() -> int:
     marks: dict[str, dict[str, tuple[float | None, float]]] = {}
     events: list[str] = []
     new_events: list[str] = []
+    results: dict = {}
+    last, due = 0.0, 0.0
+    flash, probes, inspect = "", 0, None
+    ev_total = 0                       # events ever added: a screen flashes the ones it missed
     LIMIT_5H = max(1.0, min(101.0, args.limit_5h))
     LIMIT_7D = max(1.0, min(101.0, args.limit_7d))
     env_path = os.path.expanduser(args.env_file)
     # One dashboard per machine writes; a second one watches. A snapshot or a diagnosis writes
     # nothing, so it neither takes the lock nor needs it.
-    lock = None if (args.once or args.diagnose) else take_lock(STATE_PATH + ".lock")
+    if client is not None or args.once or args.diagnose:
+        lock = None
+    elif DRY_RUN:
+        lock = "dry-run"             # decides like the writer; DRY_RUN stops every write
+    else:
+        lock = take_lock(STATE_PATH + ".lock")
     env_ok = args.env_write and lock is not None
     creds_path = os.path.expanduser(args.creds_file)
     # macOS keeps the login in the Keychain, so a file there is not what Claude Code reads.
@@ -3833,7 +4098,7 @@ def main() -> int:
     first_iv = min(float(_prev_iv), float(args.interval)) \
         if isinstance(_prev_iv, (int, float)) and math.isfinite(_prev_iv) and _prev_iv > 0 \
         else float(args.interval)
-    if pinned and _st0.get("pinned") != pinned:  # an older file held the raw token: drop it now
+    if client is None and pinned and _st0.get("pinned") != pinned:  # an old file held the raw token
         _st0["pinned"] = pinned
         save_state(_st0)
 
@@ -3937,7 +4202,7 @@ def main() -> int:
             _st["still_interval"] = interval
             save_state(_st)
         read_live()                        # someone may have edited the shell file behind us
-        if args.log:
+        if args.log and not DRY_RUN:
             log_readings(args.log, store, store.rows, results)
         return results
 
@@ -4205,6 +4470,623 @@ def main() -> int:
 
     read_live()
 
+    # ── the engine ─────────────────────────────────────────────────────────────────────────────
+    # Everything that probes, decides or writes, as plain functions over the state above. The
+    # dashboard's keys call them, and so does the daemon's socket. A command answers a dict with at
+    # least "ok" and "msg" — the line a dashboard flashes. Prompts stay with whoever asks.
+    diags: dict[str, dict] = {}                # id → {"running": bool, "result": dict | None}
+    checked: dict[str, dict] = {}              # token → its verification probe, for add/edit
+
+    def row_of(id_: str) -> dict[str, str] | None:
+        return next((r for r in store.rows if pin_id(store.token(r)) == id_), None)
+
+    def refuse() -> dict:
+        return {"ok": False, "msg": "another dashboard writes here — this one only watches"
+                if lock is None else "--no-env-write: the shell file is read-only"}
+
+    def tick() -> list[str]:
+        """One sweep: probe, record, rotate, warn. Returns the lines worth flashing, last wins."""
+        nonlocal results, probes, last, due
+        results = refresh()
+        probes += sum(1 for r in store.rows if not store.disabled(r))
+        last, due = time.time(), time.time() + interval
+        if burning:
+            # A hold ends at its reset or when off hours do; with a long interval the next sweep
+            # must not wait past either.
+            due = min(due, burning[1] + 5, off_ends(time.time()) + 5)
+        msgs = list(new_events[-1:])
+        was = str(LIVE.get("token") or "")
+        swap = auto_swap(results, store.rows)
+        now_live = str(LIVE.get("token") or "")
+        warns = [warn_if_in_use(results, t) for t in dict.fromkeys((now_live, was)) if t]
+        nonlocal ev_total
+        for msg in (*warns, swap):
+            if msg:
+                msgs.append(msg)
+                events.append(msg)
+                del events[:-8]
+                ev_total += 1
+        return msgs
+
+    def cmd_pin(id_: str) -> dict:
+        nonlocal pinned
+        if not env_ok:
+            return refuse()
+        row = row_of(id_)
+        if row is None:
+            return {"ok": False, "msg": "no such credential"}
+        if store.disabled(row):
+            return {"ok": False, "msg": f"'{store.name(row)}' is disabled — n enables it first"}
+        was_off = LIVE.get("idx", -1) >= 0 and not LIVE.get("active")
+        try:
+            # Manual inject is the deliberate override: it ignores the limits and it switches the
+            # credential on, which auto-rotate is not allowed to do.
+            msg = go_live(store.token(row), True)
+        except (RuntimeError, OSError) as exc:
+            return {"ok": False, "msg": f"not written: {exc}"}
+        end_burn()                                 # a hand swap ends any spend-down
+        pinned = pin_id(store.token(row))          # a hand-made choice auto-rotate respects
+        _st = load_state()
+        _st["pinned"] = pinned
+        r7p = ureset(results.get(store.token(row), {}), "r7d")
+        if r7p is not None:
+            _st["pinned_until"] = r7p              # lifts when this credential's week resets
+        else:
+            _st.pop("pinned_until", None)
+        _st.pop("burn", None)
+        save_state(_st)
+        out = f"pinned '{store.name(row)}' live — {msg}"
+        if was_off:
+            out += " · switched ON (it was off)"
+        held = env_holders()
+        if file_mode and not held:
+            out += " · open sessions switch on their next request"
+        elif file_mode:
+            out += (f" · {held} session{'s' if held > 1 else ''} still carry the old variable "
+                    f"from before — restart once (claude -r)")
+        return {"ok": True, "msg": out, "env_mode": not file_mode}
+
+    def cmd_unpin() -> dict:
+        nonlocal pinned
+        if lock is None:
+            return {"ok": False, "msg": "another dashboard owns the pin — press u there"}
+        _st = load_state()
+        had = _st.pop("pinned", None)
+        _st.pop("pinned_until", None)
+        pinned = ""
+        if had:
+            save_state(_st)
+        name = next((store.name(r) for r in store.rows if pin_id(store.token(r)) == had),
+                    None) if had else None
+        return {"ok": True, "msg": f"unpinned '{name or 'credential'}' — auto-rotate and the "
+                                   f"spend-down rule may move it now" if had else "nothing is pinned"}
+
+    def cmd_rotate_mode(mode_: str = "") -> dict:
+        nonlocal auto_rotate
+        if lock is None:
+            return {"ok": False, "msg": "another dashboard runs auto-rotate here — press T there"}
+        auto_rotate = mode_ if mode_ in ROTATE_MODES else ROTATE_MODES[
+            (ROTATE_MODES.index(auto_rotate) + 1) % len(ROTATE_MODES)]
+        st = load_state()
+        st["rotate_mode"] = auto_rotate
+        st.pop("auto_rotate", None)                # superseded by the three-way mode
+        save_state(st)
+        read_live()
+        if not env_ok:
+            out = f"auto-rotate {auto_rotate} — but --no-env-write blocks every write"
+        elif auto_rotate == "off":
+            out = "auto-rotate OFF — the shell file is left alone entirely"
+        elif auto_rotate == "park":
+            out = (f"auto-rotate PARK — past 5h {LIMIT_5H:.0f}% or weekly {LIMIT_7D:.0f}% the best "
+                   f"credential is recorded switched off · z activates it")
+        else:
+            out = f"auto-rotate ON — swaps at 5h {LIMIT_5H:.0f}% or weekly {LIMIT_7D:.0f}%"
+        return {"ok": True, "msg": out}
+
+    def cmd_disable(id_: str) -> dict:
+        nonlocal due
+        if store.readonly:
+            return {"ok": False, "msg": "list is read-only (--from-env)"}
+        if lock is None:
+            return {"ok": False, "msg": "another dashboard writes here — press n there"}
+        row = row_of(id_)
+        if row is None:
+            return {"ok": False, "msg": "no such credential"}
+        on = not store.disabled(row)
+        store.set_disabled(row, on)
+        try:
+            saved = store.save()
+        except (RuntimeError, OSError) as exc:
+            store.set_disabled(row, not on)
+            return {"ok": False, "msg": f"not changed: {exc}"}
+        tok_n = store.token(row)
+        results[tok_n] = dict(DISABLED_R) if on else {}
+        out = f"{'disabled' if on else 'enabled'} '{store.name(row)}' — {saved}"
+        if on and LIVE.get("token") == tok_n:
+            out += (" · it is live: auto-rotate moves off it now" if auto_rotate == "on" else
+                    f" · it is still live — p another credential (auto-rotate is {auto_rotate})")
+        due = 0.0                                  # refresh now, so the change shows at once
+        return {"ok": True, "msg": out}
+
+    def cmd_toggle_live() -> dict:
+        rec = str(LIVE.get("token") or "")
+        rec_row = next((r for r in store.rows if store.token(r) == rec), None)
+        if not LIVE.get("active") and rec_row is not None and store.disabled(rec_row):
+            return {"ok": False, "msg": f"'{store.name(rec_row)}' is disabled — p another "
+                                        f"credential, or n to enable it"}
+        if not env_ok:
+            return refuse()
+        try:
+            msg, _on = toggle_live(env_path, creds_path, store, file_mode, creds_ok)
+        except (RuntimeError, OSError) as exc:
+            return {"ok": False, "msg": f"not changed: {exc}"}
+        read_live()
+        end_burn()                                 # a hand switch ends any spend-down
+        return {"ok": True, "msg": msg + (" · open sessions switch on their next request"
+                                          if file_mode else
+                                          " · sessions started with the variable need a restart")}
+
+    def cmd_check(token: str, skip_id: str = "") -> dict:
+        """Validate a token and verify it with one probe, before add or edit saves it."""
+        if store.readonly:
+            return {"ok": False, "msg": "list is read-only (--from-env)"}
+        if lock is None:
+            return {"ok": False, "msg": "another dashboard writes here — this one only watches"}
+        why = validate_token(store, token, skip=row_of(skip_id) if skip_id else None)
+        if why:
+            return {"ok": False, "msg": why}
+        r = probe(token, args.timeout)
+        checked[token] = r
+        p5, p7 = upct(r, "u5h"), upct(r, "u7d")
+        verdict = (f"HTTP {r.get('code')} · 5h {p5:.0f}% · 7d {p7:.0f}%"
+                   if p5 is not None and p7 is not None
+                   else f"HTTP {r.get('code')} · {r.get('err', 'no quota headers')}")
+        return {"ok": True, "msg": verdict, "verdict": verdict}
+
+    def cmd_add(name: str, token: str) -> dict:
+        if store.readonly or lock is None:
+            return {"ok": False, "msg": "this dashboard cannot write the list"}
+        why = validate_token(store, token)
+        if why or not name:
+            return {"ok": False, "msg": f"not added: {why or 'no name'}"}
+        r = checked.pop(token, None) or probe(token, args.timeout)
+        store.add(name, token)
+        results[token] = r
+        record({token: r})
+        return {"ok": True, "msg": f"added '{name}' — {store.save()}"}
+
+    def cmd_delete(id_: str) -> dict:
+        if store.readonly or lock is None:
+            return {"ok": False, "msg": "this dashboard cannot write the list"}
+        row = row_of(id_)
+        if row is None:
+            return {"ok": False, "msg": "no such credential"}
+        store.remove(row)
+        for cache in (results, hist, still):
+            cache.pop(store.token(row), None)      # re-adding it starts a fresh clock
+        return {"ok": True, "msg": f"deleted '{store.name(row)}' — {store.save()}"}
+
+    def cmd_edit(id_: str, new_name: str = "", new_tok: str = "",
+                 update_live: bool = False) -> dict:
+        nonlocal pinned
+        if store.readonly or lock is None:
+            return {"ok": False, "msg": "this dashboard cannot write the list"}
+        row = row_of(id_)
+        if row is None:
+            return {"ok": False, "msg": "no such credential"}
+        old_name, old_tok = store.name(row), store.token(row)
+        new_name, new_tok = new_name or old_name, new_tok or old_tok
+        if new_name == old_name and new_tok == old_tok:
+            return {"ok": False, "msg": "nothing changed"}
+        changed_tok = new_tok != old_tok
+        r = None
+        if changed_tok:
+            why = validate_token(store, new_tok, skip=row)
+            if why:
+                return {"ok": False, "msg": f"not changed: {why}"}
+            r = checked.pop(new_tok, None) or probe(new_tok, args.timeout)
+        idx = store.rows.index(row)
+        store.rows[idx][store.name_col] = new_name
+        bits = []
+        if new_name != old_name:
+            bits.append(f"'{old_name}' → '{new_name}'")
+        if changed_tok:
+            store.rows[idx][store.tok_col] = new_tok
+            # Every per-token dict describes the OLD credential. Carrying its readings over would
+            # attach one account's history to another's row, so they are dropped and reseeded.
+            for cache in (results, hist, marks, USAGE_OK, still):
+                cache.pop(old_tok, None)
+            if pinned and pinned == pin_id(old_tok):
+                # The pin is a choice of this row, not of a string: it follows the row.
+                pinned = pin_id(new_tok)
+                _st = load_state()
+                _st["pinned"] = pinned
+                save_state(_st)
+            if r is not None:
+                results[new_tok] = r
+                record({new_tok: r})
+            bits.append(f"token → {redact(new_tok)}")
+        out = " · ".join(bits) + f" — {store.save()}"
+        if changed_tok and update_live and env_ok and LIVE.get("token") == old_tok:
+            try:
+                end_burn()                         # a hand change ends any spend-down
+                out += " · " + go_live(new_tok, None)   # on/off stays as it was
+            except (RuntimeError, OSError) as exc:
+                out += f" · not updated: {exc}"
+                read_live()
+        return {"ok": True, "msg": out}
+
+    def cmd_refresh() -> dict:
+        nonlocal due
+        due = 0.0
+        return {"ok": True, "msg": ""}
+
+    def cmd_interval(seconds: float) -> dict:
+        nonlocal interval, due
+        interval = min(3600, max(5, int(seconds)))
+        due = last + interval
+        return {"ok": True, "msg": f"interval {interval}s"}
+
+    def cmd_token(id_: str) -> dict:
+        row = row_of(id_)
+        return {"ok": row is not None, "msg": "" if row else "no such credential",
+                "token": store.token(row) if row else ""}
+
+    def cmd_diagnose(id_: str) -> dict:
+        row = row_of(id_)
+        if row is None or store.disabled(row):
+            return {"ok": False, "msg": "no such credential" if row is None else
+                    f"'{store.name(row)}' is disabled — never used, so not tested either"}
+        if (diags.get(id_) or {}).get("running"):
+            return {"ok": True, "msg": f"still diagnosing '{store.name(row)}'"}
+        diags[id_] = {"running": True, "result": None}
+        tok_d = store.token(row)
+
+        def run() -> None:
+            res = diagnose(tok_d, args.timeout)
+            diags[id_] = {"running": False, "result": res}
+        threading.Thread(target=run, daemon=True).start()
+        return {"ok": True, "msg": f"diagnosing '{store.name(row)}' — about 30 seconds"}
+
+    def setting_values() -> dict[str, str]:
+        out_ = {k_: setting_text(k_, getattr(args, k_[len("CTR_"):].lower(), ""))
+                for k_ in SETTINGS}
+        out_["CTR_ROTATE_MODE"] = auto_rotate
+        return out_
+
+    def cmd_set(key: str, text: str) -> dict:
+        """Change one setting now and save it to .env. A screen-only one (view, sort, colour,
+        title, mouse) is saved here and applied by the dashboard that asked."""
+        nonlocal interval, due, auto_rotate, burn_on, notify_ok
+        global LIMIT_5H, LIMIT_7D, ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING
+        global BURN_WINDOW, BURN_IDLE, BURN_MIN, NIGHT_FROM, NIGHT_UNTIL
+        global REBALANCE_IDLE, MIN_HEADROOM, HOLIDAYS_PATH, OFF_LIFT_5H
+        if key not in SETTINGS:
+            return {"ok": False, "msg": f"unknown setting {key}"}
+        if lock is None:
+            return {"ok": False, "msg": "another dashboard writes here — change settings there"}
+        try:
+            val = convert_setting(key, text)
+        except ConfigError as exc:
+            return {"ok": False, "msg": f"not changed: {exc}"}
+        dest = key[len("CTR_"):].lower()
+        setattr(args, dest, val)
+        live_ = SETTINGS[key][4]
+        if dest == "limit_5h":
+            LIMIT_5H = max(1.0, min(101.0, val))
+        elif dest == "limit_7d":
+            LIMIT_7D = max(1.0, min(101.0, val))
+        elif dest == "rotate_gap":
+            ROTATE_GAP = max(0.0, val)
+        elif dest == "reset_tie":
+            RESET_TIE = max(0.0, val) * 60
+        elif dest == "pin_grace":
+            PIN_GRACE = max(0.0, val) * 60
+        elif dest == "pin_ceiling":
+            PIN_CEILING = max(1.0, min(101.0, val))
+        elif dest == "burn_window":
+            BURN_WINDOW = max(1.0, val) * 60
+        elif dest == "burn_idle":
+            BURN_IDLE = max(0.0, val) * 60
+        elif dest == "burn_min":
+            BURN_MIN = max(0.0, val) * 60
+        elif dest == "night_from":
+            NIGHT_FROM = max(0.0, min(24.0, val))
+        elif dest == "night_until":
+            NIGHT_UNTIL = max(0.0, min(24.0, val))
+        elif dest == "rebalance_idle":
+            REBALANCE_IDLE = max(0.0, val) * 60
+        elif dest == "min_headroom":
+            MIN_HEADROOM = max(0.0, min(100.0, val))
+        elif dest == "off_lift_5h":
+            OFF_LIFT_5H = bool(val)
+        elif dest == "holidays":
+            HOLIDAYS_PATH = val
+        elif dest == "interval":
+            interval = min(3600, max(5, int(val)))
+            due = last + interval
+        elif dest == "notify":
+            notify_ok = bool(val)
+        elif dest == "burn":
+            burn_on = bool(val)
+        elif dest == "rotate_mode" and val:
+            auto_rotate = str(val)
+            st_ = load_state()
+            st_["rotate_mode"] = auto_rotate
+            save_state(st_)
+            read_live()
+        try:
+            write_env_value(ENV_PATH, key, text)
+        except OSError as exc:
+            return {"ok": True, "value": val, "msg": f"{SETTINGS[key][1]} → {text or 'default'} "
+                                                     f"for this run; .env not saved: {exc}"}
+        if sources.get(key) in ("flag", "env"):
+            note = " · a flag or CTR_ in the environment still wins on the next start"
+        else:
+            note = ""
+            sources[key] = ".env"
+        return {"ok": True, "value": val,
+                "msg": f"{SETTINGS[key][1]} → {setting_text(key, val) or 'default'} · saved to "
+                       f".env" + ("" if live_ else " · applies on the next start") + note}
+
+    E = types.SimpleNamespace(
+        tick=tick, pin=cmd_pin, unpin=cmd_unpin, rotate_mode=cmd_rotate_mode,
+        disable=cmd_disable, toggle_live=cmd_toggle_live, check=cmd_check, add=cmd_add,
+        delete=cmd_delete, edit=cmd_edit, refresh=cmd_refresh, interval=cmd_interval,
+        token=cmd_token, diagnose=cmd_diagnose, set=cmd_set, values=setting_values)
+
+    def snapshot() -> dict:
+        """Everything a screen draws, keyed by credential id. Never a token."""
+        ids = {store.token(r): pin_id(store.token(r)) for r in store.rows}
+        # An allowlist, not a denylist: LIVE also carries the shell file's lines, export and all.
+        live = {k: LIVE[k] for k in ("path", "exists", "idx", "active", "name", "ambiguous",
+                                     "err", "auto", "writable", "mode", "held") if k in LIVE}
+        live["token"] = ids.get(str(LIVE.get("token") or ""), "")
+        return {"now": time.time(), "last": last, "due": due, "interval": interval,
+                "probes": probes, "auto": auto_rotate, "events": events[-8:], "ev_total": ev_total,
+                "rows": [{"id": ids[store.token(r)], "name": store.name(r), "tail": store.tail(r),
+                          "disabled": store.disabled(r)} for r in store.rows],
+                "results": {ids[t]: v for t, v in results.items() if t in ids},
+                "hist": {ids[t]: v for t, v in hist.items() if t in ids},
+                "still": {ids[t]: [v[0][0], v[0][1], v[1], v[2] if len(v) > 2 else v[1]]
+                          for t, v in still.items() if t in ids},
+                "live": live, "pinned": pinned or "",
+                "burning": list(burning) if burning else None,
+                "diags": diags, "settings": setting_values(), "sources": sources,
+                "writable": bool(env_ok and not DRY_RUN), "file_mode": file_mode,
+                "env_path": env_path, "creds_path": creds_path, "dry_run": DRY_RUN,
+                "globals": {"LIMIT_5H": LIMIT_5H, "LIMIT_7D": LIMIT_7D,
+                            "OFF_LIFT_5H": OFF_LIFT_5H, "NIGHT_FROM": NIGHT_FROM,
+                            "NIGHT_UNTIL": NIGHT_UNTIL, "CAP_USD": CAP_USD, "POOL": POOL,
+                            "HOLIDAYS_PATH": HOLIDAYS_PATH}}
+
+    def dispatch(req: dict) -> dict:
+        c, a = str(req.get("cmd") or ""), req
+        if c == "hello":
+            return {"ok": True, "msg": "", "version": VERSION, "proto": PROTO,
+                    "pid": os.getpid(), "dry_run": DRY_RUN}
+        if c == "snapshot":
+            return {"ok": True, "msg": "", **snapshot()}
+        if c == "token":
+            return E.token(str(a.get("id") or ""))
+        if c == "refresh":
+            return E.refresh()
+        if DRY_RUN:
+            return {"ok": False, "msg": "dry-run daemon: it changes nothing"}
+        sid = str(a.get("id") or "")
+        handlers = {
+            "pin": lambda: E.pin(sid), "unpin": E.unpin, "toggle_live": E.toggle_live,
+            "rotate_mode": lambda: E.rotate_mode(str(a.get("mode") or "")),
+            "disable": lambda: E.disable(sid), "delete": lambda: E.delete(sid),
+            "check": lambda: E.check(str(a.get("token") or ""), str(a.get("skip") or "")),
+            "add": lambda: E.add(str(a.get("name") or ""), str(a.get("token") or "")),
+            "edit": lambda: E.edit(sid, str(a.get("name") or ""), str(a.get("token") or ""),
+                                   bool(a.get("update_live"))),
+            "interval": lambda: E.interval(float(a.get("seconds") or 0)),
+            "diagnose": lambda: E.diagnose(sid),
+            "set": lambda: E.set(str(a.get("key") or ""),
+                                 "" if a.get("value") is None else str(a.get("value"))),
+        }
+        if c not in handlers:
+            return {"ok": False, "msg": f"unknown command {c!r}"}
+        try:
+            return handlers[c]()
+        except Exception as exc:                 # noqa: BLE001 — one bad command must not kill it
+            return {"ok": False, "msg": f"failed: {exc}"}
+
+    def run_daemon() -> int:
+        """The engine, headless: a refresh every interval, commands from any number of screens."""
+        if lock is None:
+            print(f"claude-token-rotate daemon: another one holds {STATE_PATH}.lock — already "
+                  f"running", file=sys.stderr)
+            return 1
+        path = socket_path(args.socket or "")
+        where = os.path.dirname(path) or "."
+        st_w = os.stat(where)
+        if st_w.st_uid != os.getuid() or st_w.st_mode & 0o002:
+            # Not even a sticky /tmp: someone else could have put a socket there first.
+            print(f"refusing {where}: the socket's directory must be yours and not writable by "
+                  f"everyone ($XDG_RUNTIME_DIR is)", file=sys.stderr)
+            return 1
+        if os.path.lexists(path):
+            import stat as _stat
+            if not _stat.S_ISSOCK(os.lstat(path).st_mode):
+                print(f"refusing {path}: it is not a socket", file=sys.stderr)
+                return 1
+            probe_s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe_s.connect(path)            # anything listening, busy or not, is alive
+                print(f"a daemon already listens on {path}", file=sys.stderr)
+                return 1
+            except OSError:
+                os.unlink(path)                  # stale: nothing listening
+            finally:
+                probe_s.close()
+        guard = threading.RLock()
+        # The snapshot screens poll is serialised under the lock after every refresh and every
+        # command, and served from that copy, so a sweep that takes seconds never makes a screen
+        # (or `status`) wait. `hello` needs no state at all.
+        latest = {"json": json.dumps(snapshot(), default=str)}
+
+        def answer(req: dict) -> str:
+            c = req.get("cmd")
+            if c == "hello":
+                resp = dispatch(req)
+            elif c == "snapshot":
+                return ('{"v": %d, "id": %s, "ok": true, "msg": "", ' %
+                        (PROTO, json.dumps(req.get("id"))) + latest["json"][1:])
+            else:
+                with guard:
+                    resp = dispatch(req)
+                    latest["json"] = json.dumps(snapshot(), default=str)
+            return json.dumps({**resp, "v": PROTO, "id": req.get("id")}, default=str)
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self) -> None:
+                if peer_uid(self.request) != os.getuid():
+                    return                       # the socket is 0600; this is the second lock
+                while True:
+                    raw = self.rfile.readline(65537)
+                    if not raw:
+                        return
+                    bad = json.dumps({"v": PROTO, "id": None, "ok": False, "error": "bad request",
+                                      "msg": "bad request"})
+                    if len(raw) > 65536 or not raw.endswith(b"\n"):
+                        out = bad
+                        while raw and not raw.endswith(b"\n"):   # drop the rest of that line
+                            raw = self.rfile.readline(65537)
+                    else:
+                        try:
+                            req = json.loads(raw)
+                            if not isinstance(req, dict):
+                                raise ValueError
+                            out = answer(req)
+                        except (ValueError, RecursionError):
+                            out = bad
+                    try:
+                        self.wfile.write((out + "\n").encode())
+                    except OSError:
+                        return
+
+        class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+
+        old = os.umask(0o177)                     # the socket is born 0600, never wider
+        try:
+            srv = Server(path, Handler)
+        finally:
+            os.umask(old)
+        os.chmod(path, 0o600)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        import signal
+
+        def leave(sig, _frame):
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, leave)
+        signal.signal(signal.SIGHUP, leave)
+        print(f"claude-token-rotate daemon {VERSION} · pid {os.getpid()} · {path}"
+              + (" · DRY RUN (writes nothing)" if DRY_RUN else ""), flush=True)
+        shadow = os.path.join(app_dir(), ".cache", "shadow")
+        try:
+            while True:
+                with guard:
+                    if time.time() >= due:
+                        del DRY_WOULD[:]
+                        for m_ in E.tick():
+                            print(m_, flush=True)
+                        latest["json"] = json.dumps(snapshot(), default=str)
+                        if DRY_RUN:
+                            os.makedirs(shadow, exist_ok=True)
+                            st_ = load_state()
+                            by_id = {pin_id(store.token(r)): store.name(r) for r in store.rows}
+                            rec = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "would": list(DRY_WOULD),
+                                   "live": LIVE.get("name"), "active": bool(LIVE.get("active")),
+                                   "pinned": by_id.get(str(st_.get("pinned") or "")),
+                                   "burn": by_id.get(str((st_.get("burn") or {}).get("id") or ""))}
+                            with open(os.path.join(shadow, time.strftime("%Y-%m-%d") + ".jsonl"),
+                                      "a", encoding="utf-8") as fh:
+                                fh.write(json.dumps(rec) + "\n")
+                        _tick_hook(time.time())
+                time.sleep(min(DAEMON_POLL, max(0.02, due - time.time())))
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return 0
+
+    if args.cmd == "daemon":
+        return run_daemon()
+
+    # A screen of the daemon: the same keys, but every command goes over the socket and every
+    # refresh is the daemon's snapshot.
+    shown: dict = {}
+
+    def pull() -> list[str]:
+        nonlocal results, hist, still, pinned, burning, auto_rotate, interval, last, due
+        nonlocal probes, env_ok, file_mode, env_path, creds_path, lock
+        global LIMIT_5H, LIMIT_7D, OFF_LIFT_5H, NIGHT_FROM, NIGHT_UNTIL, CAP_USD, POOL
+        global HOLIDAYS_PATH
+        snap = client.call("snapshot")
+        if not snap.get("ok"):
+            lock, env_ok = None, False
+            if shown.get("gone"):
+                return []
+            shown["gone"] = True
+            return ["daemon gone — reconnecting … (nothing is written meanwhile)"]
+        msgs = ["daemon back"] if shown.pop("gone", None) else []
+        rows_ = snap["rows"]
+        store.rows = [{NAME_COL: x["name"], TOKEN_COL: x["id"],
+                       DISABLED_COL: "yes" if x["disabled"] else ""} for x in rows_]
+        store.all_rows = store.rows
+        store.tails = {x["id"]: x["tail"] for x in rows_}
+        results, hist = snap["results"], snap["hist"]
+        still = {k: ((v[0], v[1]), v[2], v[3]) for k, v in snap["still"].items()}
+        LIVE.clear()
+        LIVE.update(snap["live"])
+        pinned = snap.get("pinned") or ""
+        burning = tuple(snap["burning"]) if snap.get("burning") else None
+        auto_rotate, interval = snap["auto"], snap["interval"]
+        last, due, probes = snap["last"], snap["due"], snap["probes"]
+        env_ok, lock = snap["writable"], ("daemon" if snap["writable"] else None)
+        file_mode, env_path, creds_path = snap["file_mode"], snap["env_path"], snap["creds_path"]
+        diags.clear()
+        diags.update(snap["diags"])
+        sources.clear()
+        sources.update(snap["sources"])
+        shown["settings"] = snap["settings"]
+        g = snap["globals"]
+        LIMIT_5H, LIMIT_7D, OFF_LIFT_5H = g["LIMIT_5H"], g["LIMIT_7D"], g["OFF_LIFT_5H"]
+        NIGHT_FROM, NIGHT_UNTIL, CAP_USD = g["NIGHT_FROM"], g["NIGHT_UNTIL"], g["CAP_USD"]
+        POOL, HOLIDAYS_PATH = g["POOL"] or {}, g["HOLIDAYS_PATH"]
+        events[:] = snap["events"]
+        seen, total = shown.get("ev", None), int(snap.get("ev_total") or 0)
+        if seen is not None and total > seen:
+            msgs += snap["events"][-min(total - seen, len(snap["events"])):]
+        shown["ev"] = total
+        return msgs
+
+    if client is not None:
+        R = client
+        E = types.SimpleNamespace(
+            tick=pull, pin=lambda i: R.call("pin", id=i), unpin=lambda: R.call("unpin"),
+            rotate_mode=lambda m="": R.call("rotate_mode", mode=m),
+            disable=lambda i: R.call("disable", id=i), toggle_live=lambda: R.call("toggle_live"),
+            check=lambda t, skip="": R.call("check", token=t, skip=skip),
+            add=lambda n, t: R.call("add", name=n, token=t),
+            delete=lambda i: R.call("delete", id=i),
+            edit=lambda i, n="", t="", u=False: R.call("edit", id=i, name=n, token=t,
+                                                        update_live=u),
+            refresh=lambda: R.call("refresh"), interval=lambda sec: R.call("interval", seconds=sec),
+            token=lambda i: R.call("token", id=i), diagnose=lambda i: R.call("diagnose", id=i),
+            set=lambda k, t: R.call("set", key=k, value=t),
+            values=lambda: shown.get("settings", {}))
+        pull()
+
     if args.diagnose:
         want = args.diagnose.strip().lower()
         row = next((r for r in store.rows if store.name(r).lower() == want), None)
@@ -4237,11 +5119,14 @@ def main() -> int:
                          alert=args.alert, inspect=None, events=events))
         return 0 if all(r.get("ok") for r in results.values()) else 1
 
-    flash, probes, inspect = "", 0, None
-    if lock is None:
+    if client is None:
+        flash, probes, inspect = "", 0, None
+    if client is not None:
+        flash = "a screen of the daemon — it probes and rotates; every key here goes to it"
+    elif lock is None:
         flash = ("another dashboard is already running on this machine — this one only watches "
                  "(no rotation, p / z / T are read-only)")
-    if file_mode:
+    if file_mode and client is None:             # a screen of the daemon writes nothing, ever
         # A token the shell still exports is handed to every session started from it, and those
         # sessions then ignore the credentials file for good. Move it over, once, up front.
         try:
@@ -4256,8 +5141,9 @@ def main() -> int:
                              if n else "")
             events.append(flash)
     diag: tuple[str, dict] | None = None
-    results: dict = {}
-    last, due = 0.0, 0.0
+    if client is None:
+        results = {}
+        last, due = 0.0, 0.0
     live_tty = sys.stdout.isatty()
     title_on, last_title = live_tty and args.title, ""
     if live_tty:
@@ -4268,54 +5154,16 @@ def main() -> int:
             cursor = ""                        # the selected row, by token: survives a re-sort
             view, detail_tok, set_sel = "table", "", 0   # which panel is on screen
 
-            def apply_setting(key: str, text: str) -> str:
-                """Change one setting now and save it to .env. Returns the line to flash."""
-                nonlocal interval, due, mode, sort, desc, color, title_on, auto_rotate, burn_on
-                nonlocal notify_ok
-                global LIMIT_5H, LIMIT_7D, ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING
-                global BURN_WINDOW, BURN_IDLE, BURN_MIN, NIGHT_FROM, NIGHT_UNTIL
-                global REBALANCE_IDLE, MIN_HEADROOM, HOLIDAYS_PATH, OFF_LIFT_5H
-                try:
-                    val = convert_setting(key, text)
-                except ConfigError as exc:
-                    return f"not changed: {exc}"
-                dest = key[len("CTR_"):].lower()
-                setattr(args, dest, val)
-                live_ = SETTINGS[key][4]
-                if dest == "limit_5h":
-                    LIMIT_5H = max(1.0, min(101.0, val))
-                elif dest == "limit_7d":
-                    LIMIT_7D = max(1.0, min(101.0, val))
-                elif dest == "rotate_gap":
-                    ROTATE_GAP = max(0.0, val)
-                elif dest == "reset_tie":
-                    RESET_TIE = max(0.0, val) * 60
-                elif dest == "pin_grace":
-                    PIN_GRACE = max(0.0, val) * 60
-                elif dest == "pin_ceiling":
-                    PIN_CEILING = max(1.0, min(101.0, val))
-                elif dest == "burn_window":
-                    BURN_WINDOW = max(1.0, val) * 60
-                elif dest == "burn_idle":
-                    BURN_IDLE = max(0.0, val) * 60
-                elif dest == "burn_min":
-                    BURN_MIN = max(0.0, val) * 60
-                elif dest == "night_from":
-                    NIGHT_FROM = max(0.0, min(24.0, val))
-                elif dest == "night_until":
-                    NIGHT_UNTIL = max(0.0, min(24.0, val))
-                elif dest == "rebalance_idle":
-                    REBALANCE_IDLE = max(0.0, val) * 60
-                elif dest == "min_headroom":
-                    MIN_HEADROOM = max(0.0, min(100.0, val))
-                elif dest == "off_lift_5h":
-                    OFF_LIFT_5H = bool(val)
-                elif dest == "holidays":
-                    HOLIDAYS_PATH = val
-                elif dest == "interval":
-                    interval = min(3600, max(5, int(val)))
-                    due = last + interval
-                elif dest == "view":
+            diag_id = ""
+
+            def ui_set(key: str, text: str) -> str:
+                """Settings screen: the engine saves and applies it; screen-only ones land here."""
+                nonlocal mode, sort, desc, color, title_on
+                res = E.set(key, text)
+                if not res.get("ok"):
+                    return res["msg"]
+                dest, val = key[len("CTR_"):].lower(), res.get("value")
+                if dest == "view":
                     mode = val
                 elif dest == "sort":
                     sort, desc = val, val in SORT_DESC
@@ -4326,48 +5174,13 @@ def main() -> int:
                 elif dest == "mouse":
                     keys.mouse = bool(val) and keys.unix and sys.stdout.isatty()
                     sys.stdout.write(MOUSE_ON if keys.mouse else MOUSE_OFF)
-                elif dest == "notify":
-                    notify_ok = bool(val)
-                elif dest == "burn":
-                    burn_on = bool(val)
-                elif dest == "rotate_mode" and val:
-                    auto_rotate = str(val)
-                    st_ = load_state()
-                    st_["rotate_mode"] = auto_rotate
-                    save_state(st_)
-                    read_live()
-                try:
-                    write_env_value(ENV_PATH, key, text)
-                except OSError as exc:
-                    return f"{SETTINGS[key][1]} → {text or 'default'} for this run; .env not saved: {exc}"
-                if sources.get(key) in ("flag", "env"):
-                    note = " · a flag or CTR_ in the environment still wins on the next start"
-                else:
-                    note = ""
-                    sources[key] = ".env"
-                return (f"{SETTINGS[key][1]} → {setting_text(key, val) or 'default'} · saved to "
-                        f".env" + ("" if live_ else " · applies on the next start") + note)
+                return res["msg"]
 
-            def setting_values() -> dict[str, str]:
-                out_ = {k_: setting_text(k_, getattr(args, k_[len("CTR_"):].lower(), ""))
-                        for k_ in SETTINGS}
-                out_["CTR_ROTATE_MODE"] = auto_rotate
-                return out_
-            if live_tty and os.name != "nt":
-                hold_terminal(keys, title_on)
             while True:
-                swept = False
-                if time.time() >= due:
-                    results = refresh()
-                    swept = True
-                    probes += sum(1 for r in store.rows if not store.disabled(r))
-                    last, due = time.time(), time.time() + interval
-                    if burning:
-                        # A hold ends at its reset or when off hours do; with a long interval the
-                        # next sweep must not wait past either.
-                        due = min(due, burning[1] + 5, off_ends(time.time()) + 5)
-                    if new_events:
-                        flash = new_events[-1]
+                if client is not None or time.time() >= due:
+                    msgs = E.tick()
+                    if msgs:
+                        flash = msgs[-1]
                     if args.alert is not None:
                         for row in store.rows:
                             tok = store.token(row)
@@ -4376,7 +5189,8 @@ def main() -> int:
                                                    upct(r, "uov")) if p is not None] or [0])
                             if hot >= args.alert and tok not in alerted:
                                 alerted.add(tok)
-                                flash = f"{store.name(row)} crossed {args.alert:.0f}% ({hot:.0f}%)"
+                                if not msgs:
+                                    flash = f"{store.name(row)} crossed {args.alert:.0f}% ({hot:.0f}%)"
                                 sys.stdout.write("\a")
                             elif hot < args.alert:
                                 alerted.discard(tok)
@@ -4384,16 +5198,6 @@ def main() -> int:
                 rows = sort_rows(store, store.rows, results, sort, desc)
                 if cursor and cursor not in {store.token(r_) for r_ in rows}:
                     cursor = ""
-                if swept:
-                    was = str(LIVE.get("token") or "")
-                    swap = auto_swap(results, rows)
-                    now_live = str(LIVE.get("token") or "")
-                    warns = [warn_if_in_use(results, t) for t in dict.fromkeys((now_live, was)) if t]
-                    for msg in (*warns, swap):
-                        if msg:
-                            flash = msg
-                            events.append(msg)
-                            del events[:-8]
                 if title_on:
                     t = title_safe(title_text(store, rows, results))
                     if t != last_title:            # only on change: some terminals redraw the tab
@@ -4411,13 +5215,16 @@ def main() -> int:
                                    wide, size.lines, color, right=time.strftime("%H:%M:%S"),
                                    hint="↑↓ other credential · ← / Esc back · p pin · n disable"
                                         + (f" · {flash}" if flash else ""))
-                elif view == "diag" and diag:
-                    drow = next((r_ for r_ in rows if store.token(r_) == diag[0]), None)
-                    frame = screen("DIAGNOSE · which paths still work",
-                                   diagnose_lines(store.name(drow) if drow else "?", diag[1], color),
+                elif view == "diag" and diag_id in diags:
+                    drow = next((r_ for r_ in rows if pin_id(store.token(r_)) == diag_id), None)
+                    dres = diags[diag_id]
+                    body = diagnose_lines(store.name(drow) if drow else "?", dres["result"], color) \
+                        if dres.get("result") else [f"diagnosing {store.name(drow) if drow else '?'} "
+                                                    f"— about 30 seconds …"]
+                    frame = screen("DIAGNOSE · which paths still work", body,
                                    wide, size.lines, color, hint="← / Esc back")
                 elif view == "settings":
-                    sl = settings_lines(setting_values(), set_sel, color, sources, wide)
+                    sl = settings_lines(E.values(), set_sel, color, sources, wide)
                     at_sel = next((k_ for k_, ln in enumerate(sl) if ln.startswith(CURSOR_BG)
                                    or ln.startswith("›")), 0)
                     room = max(3, size.lines - 4)
@@ -4456,7 +5263,7 @@ def main() -> int:
                     skeys = list(SETTINGS)
                     k_ = skeys[set_sel]
                     kind = next(kd for kk, kd, _ in CONFIG if kk == k_)
-                    cur_txt = setting_values()[k_]
+                    cur_txt = E.values()[k_]
                     if key in ("\x1b", "q", "Q", ","):
                         view, flash = "table", ""
                     elif key in UP:
@@ -4470,24 +5277,24 @@ def main() -> int:
                     elif lock is None:
                         flash = "another dashboard writes here — change settings there"
                     elif kind == "bool" and key in ENTER + (" ",) + LEFT + RIGHT:
-                        flash = apply_setting(k_, "false" if cur_txt == "true" else "true")
+                        flash = ui_set(k_, "false" if cur_txt == "true" else "true")
                     elif isinstance(kind, tuple) and key in ENTER + (" ",) + LEFT + RIGHT:
                         opts = [o for o in kind if o]
                         at_o = opts.index(cur_txt) if cur_txt in opts else -1
                         nxt = opts[(at_o + (-1 if key in LEFT else 1)) % len(opts)]
-                        flash = apply_setting(k_, nxt)
+                        flash = ui_set(k_, nxt)
                     elif kind in ("int", "float", "float?") and key in LEFT + RIGHT:
                         step = SETTINGS[k_][3] or 1
                         base = float(cur_txt) if cur_txt not in ("", "—") else 0.0
                         newv = max(0.0, base + (step if key in RIGHT else -step))
-                        flash = apply_setting(k_, f"{newv:g}")
+                        flash = ui_set(k_, f"{newv:g}")
                     elif key in ENTER + (" ",):
                         ans = ask(keys, f"\n  {SETTINGS[k_][1]} [{cur_txt or 'default'}] — new "
                                         f"value, blank keeps it, '-' resets to the default: ")
                         if ans == "-":
-                            flash = apply_setting(k_, "")
+                            flash = ui_set(k_, "")
                         elif ans:
-                            flash = apply_setting(k_, ans)
+                            flash = ui_set(k_, ans)
                     continue
                 if view == "detail":
                     if key in ("\x1b", "q", "Q", "i") + LEFT + ENTER:
@@ -4559,39 +5366,32 @@ def main() -> int:
                 if key in ("h", "w", "b", "o"):
                     mode = key
                 elif key == "r":
-                    due = 0.0
+                    E.refresh()
                 elif key == "s":
                     sort = SORTS[(SORTS.index(sort) + 1) % len(SORTS)]
                     desc = sort in SORT_DESC
                     flash = f"sorted by {sort_label(sort, desc)}"
                 elif key in ("+", "="):
-                    interval = min(3600, interval * 2)
-                    due = last + interval
-                    flash = f"interval {interval}s"
+                    flash = E.interval(interval * 2)["msg"]
                 elif key in ("-", "_"):
-                    interval = max(5, interval // 2)
-                    due = last + interval
-                    flash = f"interval {interval}s"
+                    flash = E.interval(interval // 2)["msg"]
                 elif key == "D":
-                    if diag and diag[0] == cursor:
-                        view = "diag"                      # the last result, without re-spending
-                        continue
                     i = pick_row(keys, store, rows, "diagnose", cursor)
                     if i < 0:
                         flash = "diagnose cancelled"
                         continue
                     row = rows[i]
+                    id_d = pin_id(store.token(row))
+                    if (diags.get(id_d) or {}).get("result") or (diags.get(id_d) or {}).get("running"):
+                        diag_id, view = id_d, "diag"        # the last result, without re-spending
+                        continue
                     ok = ask(keys, f"  diagnose '{store.name(row)}' — spends {len(TIERS) + 1} API "
                                    f"and {len(TIERS)} `claude -p` calls, takes ~30s. [y/N]: ")
                     if not ok.lower().startswith("y"):
                         flash = "diagnose cancelled"
                         continue
-                    sys.stdout.write(HOME + "\n  diagnosing " + store.name(row) + " …\n")
-                    sys.stdout.flush()
-                    diag = (store.token(row), diagnose(store.token(row), args.timeout))
-                    flash = f"diagnosed '{store.name(row)}'"
-                    view = "diag"
-                    due = 0.0
+                    flash = E.diagnose(id_d)["msg"]
+                    diag_id, view = id_d, "diag"
                 elif key == "x":
                     via = copy_to_clipboard(markdown(store, rows, results))
                     flash = f"table copied as Markdown via {via}" if via else "no clipboard found"
@@ -4601,7 +5401,11 @@ def main() -> int:
                         flash = "no usable credential to pick"
                     else:
                         row, p = pick
-                        via = copy_to_clipboard(store.token(row))
+                        got = E.token(pin_id(store.token(row)))
+                        if not got.get("token"):
+                            flash = got.get("msg") or "no token to copy"
+                            continue
+                        via = copy_to_clipboard(got["token"])
                         flash = (f"copied '{store.name(row)}' — furthest from any limit, "
                                  f"{p:.0f}% on its busiest window via {via}") \
                             if via else "no clipboard found"
@@ -4626,14 +5430,17 @@ def main() -> int:
                         if i >= len(rows):
                             flash = f"no row {num} — press c to type a row number"
                             continue
-                    via = copy_to_clipboard(store.token(rows[i]))
+                    got = E.token(pin_id(store.token(rows[i])))
+                    if not got.get("token"):
+                        flash = got.get("msg") or "no token to copy"
+                        continue
+                    via = copy_to_clipboard(got["token"])
                     flash = (f"copied token for '{store.name(rows[i])}' via {via} "
-                             f"({redact(store.token(rows[i]))})") if via else \
+                             f"(...{store.tail(rows[i])})") if via else \
                             "no clipboard mechanism available"
                 elif key in ("p", "t"):                # p pins; t is the old key for it
                     if not env_ok:
-                        flash = ("another dashboard writes here — this one only watches"
-                                 if lock is None else "--no-env-write: the shell file is read-only")
+                        flash = refuse()["msg"]
                         continue
                     at_c = next((k for k, r_ in enumerate(rows) if cursor and store.token(r_) == cursor), -1)
                     ans = str(at_c + 1) if at_c >= 0 else ask(
@@ -4664,80 +5471,18 @@ def main() -> int:
                     if not ok.lower().startswith("y"):
                         flash = "pin cancelled"
                         continue
-                    was_off = LIVE.get("idx", -1) >= 0 and not LIVE.get("active")
-                    try:
-                        # Manual inject is the deliberate override: it ignores the limits and it
-                        # switches the credential on, which auto-rotate is not allowed to do.
-                        msg = go_live(store.token(row), True)
-                    except (RuntimeError, OSError) as exc:
-                        flash = f"not written: {exc}"
-                        continue
-                    end_burn()                         # a hand swap ends any spend-down
-                    pinned = pin_id(store.token(row))  # a hand-made choice auto-rotate respects
-                    _st = load_state()
-                    _st["pinned"] = pinned
-                    r7p = ureset(results.get(store.token(row), {}), "r7d")
-                    if r7p is not None:
-                        _st["pinned_until"] = r7p    # lifts when this credential's week resets
-                    else:
-                        _st.pop("pinned_until", None)
-                    _st.pop("burn", None)
-                    save_state(_st)
-                    flash = f"pinned '{store.name(row)}' live — {msg}"
-                    if was_off:
-                        flash += " · switched ON (it was off)"
-                    held = env_holders()
-                    if file_mode and not held:
-                        flash += " · open sessions switch on their next request"
-                    elif file_mode:
-                        flash += (f" · {held} session{'s' if held > 1 else ''} still carry the old "
-                                  f"variable from before — restart once (claude -r)")
-                    else:
+                    res = E.pin(pin_id(store.token(row)))
+                    flash = res["msg"]
+                    if res.get("ok") and res.get("env_mode"):
                         stop = ask(keys, "  a running supervisor keeps its old credential — "
                                          "stop it now? [y/N]: ")
                         flash += " · " + (daemon_stop() if stop.lower().startswith("y")
                                           else "restart Claude Code clients to pick it up")
                 elif key == "T":
-                    if lock is None:
-                        flash = "another dashboard runs auto-rotate here — press T there"
-                        continue
-                    auto_rotate = ROTATE_MODES[
-                        (ROTATE_MODES.index(auto_rotate) + 1) % len(ROTATE_MODES)]
-                    st = load_state()
-                    st["rotate_mode"] = auto_rotate
-                    st.pop("auto_rotate", None)          # superseded by the three-way mode
-                    save_state(st)
-                    read_live()
-                    if not env_ok:
-                        flash = f"auto-rotate {auto_rotate} — but --no-env-write blocks every write"
-                    elif auto_rotate == "off":
-                        flash = "auto-rotate OFF — the shell file is left alone entirely"
-                    elif auto_rotate == "park":
-                        flash = (f"auto-rotate PARK — past 5h {LIMIT_5H:.0f}% or weekly "
-                                 f"{LIMIT_7D:.0f}% the best credential is recorded switched off "
-                                 f"· z activates it")
-                    else:
-                        flash = (f"auto-rotate ON — swaps at 5h {LIMIT_5H:.0f}% or weekly "
-                                 f"{LIMIT_7D:.0f}%")
+                    flash = E.rotate_mode("")["msg"]
                 elif key == "u":
-                    # A pin outlives the moment it was made for: it keeps auto-rotate's hands off
-                    # the credential, and keeps the spend-down rule from starting, until lifted.
-                    if lock is None:
-                        flash = "another dashboard owns the pin — press u there"
-                        continue
-                    _st = load_state()
-                    had = _st.pop("pinned", None)
-                    _st.pop("pinned_until", None)
-                    pinned = ""
-                    if had:
-                        save_state(_st)
-                    name = next((store.name(r) for r in store.rows
-                                 if pin_id(store.token(r)) == had), None) if had else None
-                    flash = (f"unpinned '{name or 'credential'}' — auto-rotate and the spend-down "
-                             f"rule may move it now" if had else "nothing is pinned")
+                    flash = E.unpin()["msg"]
                 elif key == "n":
-                    # Disabled means never used: not probed, not picked by any rule, moved off at
-                    # once if live. Kept in the CSV so it survives a restart.
                     if store.readonly:
                         flash = "list is read-only (--from-env)"
                         continue
@@ -4748,44 +5493,9 @@ def main() -> int:
                     if i < 0:
                         flash = "cancelled"
                         continue
-                    row = rows[i]
-                    on = not store.disabled(row)
-                    store.set_disabled(row, on)
-                    try:
-                        saved = store.save()
-                    except (RuntimeError, OSError) as exc:
-                        store.set_disabled(row, not on)
-                        flash = f"not changed: {exc}"
-                        continue
-                    tok_n = store.token(row)
-                    results[tok_n] = dict(DISABLED_R) if on else {}
-                    flash = f"{'disabled' if on else 'enabled'} '{store.name(row)}' — {saved}"
-                    if on and LIVE.get("token") == tok_n:
-                        flash += (" · it is live: auto-rotate moves off it now"
-                                  if auto_rotate == "on" else
-                                  " · it is still live — p another credential (auto-rotate is "
-                                  f"{auto_rotate})")
-                    due = 0.0                          # refresh now, so the change shows at once
+                    flash = E.disable(pin_id(store.token(rows[i])))["msg"]
                 elif key == "z":
-                    rec = str(LIVE.get("token") or "")
-                    rec_row = next((r_ for r_ in store.rows if store.token(r_) == rec), None)
-                    if not LIVE.get("active") and rec_row is not None and store.disabled(rec_row):
-                        flash = (f"'{store.name(rec_row)}' is disabled — p another credential, "
-                                 f"or n to enable it")
-                        continue
-                    if not env_ok:
-                        flash = ("another dashboard writes here — this one only watches"
-                                 if lock is None else "--no-env-write: the shell file is read-only")
-                        continue
-                    try:
-                        msg, _on = toggle_live(env_path, creds_path, store, file_mode, creds_ok)
-                    except (RuntimeError, OSError) as exc:
-                        flash = f"not changed: {exc}"
-                        continue
-                    read_live()
-                    end_burn()                         # a hand switch ends any spend-down
-                    flash = msg + (" · open sessions switch on their next request" if file_mode
-                                   else " · sessions started with the variable need a restart")
+                    flash = E.toggle_live()["msg"]
                 elif key == "a":
                     if store.readonly:
                         flash = "list is read-only (--from-env)"
@@ -4795,23 +5505,13 @@ def main() -> int:
                         flash = "add cancelled"
                         continue
                     token = ask(keys, f"  add — token for '{name}' (hidden): ", secret=True)
-                    why = validate_token(store, token)
-                    if why:
-                        flash = f"not added: {why}"
+                    chk = E.check(token)
+                    if not chk.get("ok"):
+                        flash = f"not added: {chk['msg']}"
                         continue
-                    r = probe(token, args.timeout)
-                    p5, p7 = upct(r, "u5h"), upct(r, "u7d")
-                    verdict = (f"HTTP {r.get('code')} · 5h {p5:.0f}% · 7d {p7:.0f}%"
-                               if p5 is not None and p7 is not None
-                               else f"HTTP {r.get('code')} · {r.get('err', 'no quota headers')}")
-                    ok = ask(keys, f"  verified: {verdict}\n  save '{name}'? [y/N]: ")
-                    if ok.lower().startswith("y"):
-                        store.add(name, token)
-                        results[token] = r
-                        record({token: r})
-                        flash = f"added '{name}' — {store.save()}"
-                    else:
-                        flash = "add cancelled"
+                    ok = ask(keys, f"  verified: {chk['verdict']}\n  save '{name}'? [y/N]: ")
+                    flash = E.add(name, token)["msg"] if ok.lower().startswith("y") \
+                        else "add cancelled"
                 elif key == "d":
                     if store.readonly:
                         flash = "list is read-only (--from-env)"
@@ -4824,18 +5524,10 @@ def main() -> int:
                     live_now = (" — this is the credential in "
                                 f"{os.path.basename(env_path)}") if LIVE.get("token") == \
                         store.token(row) else ""
-                    ok = ask(keys, f"  delete '{store.name(row)}' ({redact(store.token(row))})"
+                    ok = ask(keys, f"  delete '{store.name(row)}' (...{store.tail(row)})"
                                    f"{live_now}? [y/N]: ")
-                    if ok.lower().startswith("y"):
-                        store.remove(row)
-                        results.pop(store.token(row), None)
-                        hist.pop(store.token(row), None)
-                        still.pop(store.token(row), None)   # re-adding it starts a fresh clock
-                        if inspect == store.token(row):
-                            inspect = None
-                        flash = f"deleted '{store.name(row)}' — {store.save()}"
-                    else:
-                        flash = "delete cancelled"
+                    flash = E.delete(pin_id(store.token(row)))["msg"] \
+                        if ok.lower().startswith("y") else "delete cancelled"
                 elif key == "e":
                     if store.readonly:
                         flash = "list is read-only (--from-env)"
@@ -4845,69 +5537,29 @@ def main() -> int:
                         flash = "edit cancelled"
                         continue
                     row = rows[i]
-                    old_name, old_tok = store.name(row), store.token(row)
+                    id_e, old_name = pin_id(store.token(row)), store.name(row)
                     new_name = ask(keys, f"  name [{old_name}] (blank keeps it): ") or old_name
-                    new_tok = ask(keys, f"  token [{redact(old_tok)}] (blank keeps it, hidden): ",
-                                  secret=True) or old_tok
-                    if new_name == old_name and new_tok == old_tok:
+                    new_tok = ask(keys, f"  token [...{store.tail(row)}] (blank keeps it, "
+                                        f"hidden): ", secret=True)
+                    if new_name == old_name and not new_tok:
                         flash = "nothing changed"
                         continue
-                    changed_tok = new_tok != old_tok
-                    r = None
-                    if changed_tok:
-                        why = validate_token(store, new_tok, skip=row)
-                        if why:
-                            flash = f"not changed: {why}"
+                    if new_tok:
+                        chk = E.check(new_tok, id_e)
+                        if not chk.get("ok"):
+                            flash = f"not changed: {chk['msg']}"
                             continue
-                        # Verify before saving, exactly as `a` does: a credential list whose rows
-                        # have never answered is worse than no list at all.
-                        r = probe(new_tok, args.timeout)
-                        p5, p7 = upct(r, "u5h"), upct(r, "u7d")
-                        verdict = (f"HTTP {r.get('code')} · 5h {p5:.0f}% · 7d {p7:.0f}%"
-                                   if p5 is not None and p7 is not None
-                                   else f"HTTP {r.get('code')} · "
-                                        f"{r.get('err', 'no quota headers')}")
-                        ok = ask(keys, f"  verified: {verdict}\n  replace the token for "
+                        ok = ask(keys, f"  verified: {chk['verdict']}\n  replace the token for "
                                        f"'{new_name}'? [y/N]: ")
                         if not ok.lower().startswith("y"):
                             flash = "edit cancelled"
                             continue
-                    idx = store.rows.index(row)
-                    store.rows[idx][store.name_col] = new_name
-                    bits = []
-                    if new_name != old_name:
-                        bits.append(f"'{old_name}' → '{new_name}'")
-                    if changed_tok:
-                        store.rows[idx][store.tok_col] = new_tok
-                        # Every per-token dict describes the OLD credential. Carrying its readings
-                        # over would attach one account's history to another's row, so they are
-                        # dropped and reseeded from the probe just taken.
-                        for cache in (results, hist, marks, USAGE_OK, still):
-                            cache.pop(old_tok, None)
-                        if pinned and pinned == pin_id(old_tok) and lock is not None:
-                            # The pin is a choice of this row, not of a string: it follows the
-                            # row to its new token instead of silently lapsing.
-                            pinned = pin_id(new_tok)
-                            _st = load_state()
-                            _st["pinned"] = pinned
-                            save_state(_st)
-                        if r is not None:
-                            results[new_tok] = r
-                            record({new_tok: r})
-                        bits.append(f"token → {redact(new_tok)}")
-                    flash = " · ".join(bits) + f" — {store.save()}"
-                    # A shell still exporting the replaced value now points at a credential that
-                    # is not in the list any more, which reads as "unknown token" everywhere.
-                    if changed_tok and env_ok and LIVE.get("token") == old_tok:
-                        up = ask(keys, "  the live credential still carries the old value — "
-                                       "update it? [Y/n]: ")
-                        if not up.lower().startswith("n"):
-                            try:
-                                end_burn()                 # a hand change ends any spend-down
-                                flash += " · " + go_live(new_tok, None)   # on/off stays as it was
-                            except (RuntimeError, OSError) as exc:
-                                flash += f" · not updated: {exc}"
-                                read_live()
+                    up = False
+                    if new_tok and env_ok and LIVE.get("token") == store.token(row):
+                        ans_u = ask(keys, "  the live credential still carries the old value — "
+                                          "update it? [Y/n]: ")
+                        up = not ans_u.lower().startswith("n")
+                    flash = E.edit(id_e, new_name, new_tok, up)["msg"]
     except KeyboardInterrupt:
         pass
     finally:
