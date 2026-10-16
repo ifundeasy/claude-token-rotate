@@ -708,6 +708,20 @@ def test_burn_before_weekly_reset(d: str) -> None:
     check("burn defaults: 7h window, 2h idle", m.BURN_WINDOW == 7 * H and m.BURN_IDLE == 2 * H)
     check("burn defaults: in working hours only within 2h of the reset",
           m.BURN_WORK_WINDOW == 2 * H)
+    check("burn defaults: a week lost before work resumes qualifies all off hours long",
+          ("CTR_BURN_OFF_SPAN", "bool", True) in m.CONFIG)
+    _dt = datetime
+    _fri = _dt.datetime(2026, 10, 16, 23, 0).timestamp()
+    _tue = _dt.datetime(2026, 10, 13, 23, 0).timestamp()
+    _saved = m.NIGHT_FROM, m.NIGHT_UNTIL, m.HOLIDAYS_PATH
+    try:
+        m.NIGHT_FROM, m.NIGHT_UNTIL, m.HOLIDAYS_PATH = 22.0, 7.0, os.path.join(d, "none.txt")
+        check("off_ends: Friday night runs to Monday 07:00",
+              m.off_ends(_fri) == _dt.datetime(2026, 10, 19, 7, 0).timestamp())
+        check("off_ends: a weekday night runs to 07:00",
+              m.off_ends(_tue) == _dt.datetime(2026, 10, 14, 7, 0).timestamp())
+    finally:
+        m.NIGHT_FROM, m.NIGHT_UNTIL, m.HOLIDAYS_PATH = _saved
     check("burn defaults: a reset 6h59m away after 2h of stillness burns",
           m.burn_reason(wk(10, 50, 6 * H + 59 * 60), now=now, still_since=now - 2 * H,
                         on_machine=False, off=True) != "")

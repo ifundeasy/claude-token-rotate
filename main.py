@@ -92,7 +92,9 @@ BURN_WINDOW (7h), with quota left, that no session here carries and whose readin
 for BURN_IDLE (2h) — so nobody anywhere is on it — is made live with both limits waived — its leftover would be lost at the
 reset otherwise. It is held until the reset or a refusal; a pin outranks it. In working hours
 the limits hold, except for a week resetting in under BURN_WORK_WINDOW (2h): that one is spent down
-by the same rules, since no night reaches a reset at 14:00 on a Tuesday.
+by the same rules, since no night reaches a reset at 14:00 on a Tuesday. A week that resets
+before the off hours end (BURN_OFF_SPAN) qualifies all of them long: from Friday 22:00 for one
+that resets on Sunday.
 
 When the live credential goes past its limits while a Claude Code session ON THIS MACHINE is still
 running on it, one desktop notification says so, once per crossing. Nothing is interrupted: there
@@ -200,7 +202,7 @@ PROBE_MODEL = "claude-haiku-4-5"        # cheapest model that still returns the 
 API_VERSION = "2023-06-01"
 OAUTH_BETA = "oauth-2025-04-20"         # /v1/messages refuses an OAuth token without it
 UA = "claude-token-rotate/2.0"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 #: The client/daemon protocol. A client that speaks another one runs read-only and says so.
 PROTO = 1
 #: How long the daemon sleeps between looks at the clock, seconds.
@@ -248,6 +250,7 @@ RESET_TIE = 3600.0
 #: both limits waived — what is left of its week is spent instead of lost at the reset. Off hours
 #: is when a shared credential is least likely to be somebody else's working budget.
 #: CTR_BURN_WINDOW / CTR_BURN_IDLE (minutes) and CTR_BURN in .env, or the matching flags, change them.
+#: A week that resets before the off hours end qualifies all of them long (CTR_BURN_OFF_SPAN).
 BURN_WINDOW = 7 * 3600.0
 BURN_IDLE = 2 * 3600.0
 #: A replacement needs this many points left below each limit: 64% weekly against a 66 limit
@@ -1617,9 +1620,9 @@ def day_off(when: float, holidays: set[str], night_from: float | None = None,
 
 def off_ends(now: float) -> float:
     """When the current off hours end (now, if it is working time). Stepped in 5 minutes, up to 5 days."""
-    t = now
+    t, hol = now, load_holidays()
     for _ in range(5 * 24 * 12):
-        if not day_off(t, load_holidays()):
+        if not day_off(t, hol):
             return t
         t += 300
     return t
@@ -3432,6 +3435,7 @@ CONFIG: tuple[tuple[str, object, object], ...] = (
     ("CTR_NIGHT_FROM", "float", NIGHT_FROM),
     ("CTR_NIGHT_UNTIL", "float", NIGHT_UNTIL),
     ("CTR_BURN_UNSEEN", "bool", True),
+    ("CTR_BURN_OFF_SPAN", "bool", True),
     ("CTR_REBALANCE", "bool", True),
     ("CTR_REBALANCE_IDLE", "float", REBALANCE_IDLE / 60),
     ("CTR_MIN_HEADROOM", "float", MIN_HEADROOM),
@@ -3475,6 +3479,8 @@ SETTINGS: dict[str, tuple[str, str, str, float, bool, str]] = {
                       "and its readings have not moved for this long"),
     "CTR_BURN_MIN": ("Spend-down", "Min left", "min", 5, True,
                      "but not with less than this before the reset"),
+    "CTR_BURN_OFF_SPAN": ("Spend-down", "Whole off span", "", 0, True,
+                          "a week lost before work resumes, all off hours long"),
     "CTR_BURN_UNSEEN": ("Spend-down", "Trust unseen", "", 0, True,
                         "a credential not watched yet counts as idle"),
     "CTR_NIGHT_FROM": ("Spend-down", "Night from", "h", 1, True, "nights count as off hours from…"),
@@ -3918,6 +3924,10 @@ def main() -> int:
     ap.add_argument("--burn-min", type=finite, metavar="MIN",
                     help="…but not with less than this left before the reset · CTR_BURN_MIN "
                          "(default %(default)s)")
+    ap.add_argument("--burn-off-span", action=B,
+                    help="in off hours, a week that resets before they end is spent down from "
+                         "their start, not only in its last CTR_BURN_WINDOW · CTR_BURN_OFF_SPAN "
+                         "(default %(default)s)")
     ap.add_argument("--burn-unseen", action=B,
                     help="a credential not watched yet counts as idle, so a spend-down can start "
                          "right away; off waits CTR_BURN_IDLE of watching first · CTR_BURN_UNSEEN "
@@ -4353,8 +4363,12 @@ def main() -> int:
             _st.pop("burn", None)              # one whose reset has passed: drop the record
             save_state(_st)
         off = day_off(now, load_holidays())
-        # Working hours keep the limits; only a week about to be lost is spent down then.
+        # Working hours keep the limits; only a week about to be lost is spent down then. In off
+        # hours, a week that resets before they end (Monday 07:00 for a weekend) cannot reach
+        # anyone's working day: it qualifies all off hours long, not only in its last BURN_WINDOW.
         win = BURN_WINDOW if off else BURN_WORK_WINDOW
+        if off and args.burn_off_span:
+            win = max(win, off_ends(now) - now + 60)
         # Not while Claude Code is on the /login: nothing would be spent, and `z` back would
         # land on a credential past its limits.
         burn_ok = burn_on and auto_rotate == "on" and bool(LIVE.get("active"))

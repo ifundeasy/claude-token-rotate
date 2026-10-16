@@ -245,7 +245,7 @@ Indonesian national holiday, or any night — auto-rotate makes a credential liv
 | off hours | Saturday, Sunday, a date in `holidays.txt`, or **any night 22:00–07:00** (local clock) — so a weekend runs Friday 22:00 to Monday 07:00 |
 | not in use on this machine | not the live credential, and no running session carries it |
 | nobody else on it either | its 5h and 7d readings have not moved for **2 hours** while watched — one not watched yet (just after a start) counts as idle, so it can be picked at once (`CTR_BURN_UNSEEN`) |
-| its weekly window resets in **under 7 hours** — in working hours **under 2 hours** | the `r7d` header |
+| its weekly window resets in **under 7 hours**, or **before the off hours end** (Monday 07:00 for a weekend) — in working hours **under 2 hours** | the `r7d` header |
 | quota left | weekly under 100% and not `rejected` |
 | worth two swaps | at least 15 minutes left before the reset |
 | not about to be refused | its 5h window under 95% — it qualifies again once that window resets |
@@ -282,6 +282,12 @@ spent down by the same rules — idle for 2 hours, nobody on it here — and a s
 night carries on into the morning once its reset is that close. `0` spends down in off hours only.
 A simulated working week with every reset inside working hours (`tests/sim.py --waste`) lost
 325 points at its ten resets without it, 260 with it, and 255 with no limits at all.
+
+**A week lost before work resumes is spent all off hours long.** A credential whose week resets
+before the off hours end — Sunday 07:00 inside a weekend that ends Monday 07:00 — would reach
+nobody's working day, so it qualifies from Friday 22:00 rather than from Saturday 23:00, its last
+`CTR_BURN_WINDOW`. Idle for 2 hours still applies, so a teammate on it over the weekend keeps it.
+`CTR_BURN_OFF_SPAN=false` goes back to the window alone.
 
 `holidays.txt` beside the binary lists the national holidays (libur nasional — **cuti bersama is
 not included**), one `YYYY-MM-DD` per line, anything after the date is its name, `#` starts a
@@ -644,6 +650,7 @@ where it came from — a typo cannot silently do nothing. Relative paths are tak
 | `CTR_BURN_WORK_WINDOW` | `--burn-work-window MIN` | `120` | …and in working hours too, when it is under this far away (`0` = off hours only) |
 | `CTR_BURN_IDLE` | `--burn-idle MIN` | `120` | …and its readings have not moved for this long (2h) |
 | `CTR_BURN_MIN` | `--burn-min MIN` | `15` | …but not with less than this left before the reset |
+| `CTR_BURN_OFF_SPAN` | `--[no-]burn-off-span` | `true` | in off hours, a week resetting before they end qualifies all off hours long |
 | `CTR_BURN_UNSEEN` | `--[no-]burn-unseen` | `true` | a credential not watched yet counts as idle (no 2h wait after a start) |
 | `CTR_REBALANCE` | `--[no-]rebalance` | `true` | move to a usable credential whose week resets sooner |
 | `CTR_REBALANCE_IDLE` | `--rebalance-idle MIN` | `30` | …but not onto one whose readings moved this recently (somebody is on it) |

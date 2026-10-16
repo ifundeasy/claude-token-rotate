@@ -366,9 +366,11 @@ class Run:
     def log_lines(self) -> list[dict]:
         try:
             with open(self.path("log.jsonl")) as fh:
-                return [json.loads(x) for x in fh if x.strip()]
+                lines = fh.read().split("\n")
         except OSError:
             return []
+        # The last line may be half written; it is read whole on the next call.
+        return [json.loads(x) for x in lines[:-1] if x.strip()]
 
     def wait_frame(self, t: float, timeout: float = 20.0) -> None:
         """Until the dashboard has probed at `t` and redrawn after it."""
