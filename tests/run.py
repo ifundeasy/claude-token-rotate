@@ -309,20 +309,17 @@ def test_rotation_rules(d: str) -> None:
     check("unpinned: weekly 66% rotates", rot(live(10, 66, 7200), False))
     check("unpinned: a near 5h reset holds it too, like a pin", not rot(live(61, 10, 600), False))
     check("pinned: under both limits stays", not rot(live(50, 10, 7200), True))
-    check("pinned: 5h over, reset more than 1h away -> rotated", rot(live(70, 10, 7200), True))
-    check("pinned: 5h over, reset in 45 min -> held", not rot(live(70, 10, 2700), True))
-    check("pinned: 5h over, reset in exactly 1h -> held", not rot(live(70, 10, 3600), True))
-    check("pinned: 5h over, reset in 20 min -> held", not rot(live(94, 10, 1200), True))
-    check("pinned: held only until 95%", rot(live(95, 10, 1200), True))
-    check("pinned: weekly over -> rotated even near a 5h reset", rot(live(10, 80, 1200), True))
+    check("pinned: 5h over, reset far off -> held: a hand choice beats the limit",
+          not rot(live(70, 10, 7200), True))
+    check("pinned: 5h at 99% -> still held", not rot(live(99, 10, 7200), True))
+    check("pinned: weekly over -> held", not rot(live(10, 80, 7200), True))
     check("pinned: weekly spent -> rotated",
           rot({**live(10, 100, 7200), "s7d": "rejected", "ok": False, "code": 429}, True))
-    check("pinned: spent -> rotated",
+    check("pinned: 5h spent -> rotated",
           rot({**live(100, 10, 1200), "s5h": "rejected", "ok": False, "code": 429}, True))
-    check("pinned: an unknown reset counts as far off", rot(reading(70, 10), True))
-    why = m.needs_rotate(live(70, 10, 2700), True, now=now)[1]
-    check("a held pin says why", "95" in why)
-
+    check("pinned: disabled -> rotated", rot(dict(m.DISABLED_R), True))
+    why = m.needs_rotate(live(70, 80, 2700), True, now=now)[1]
+    check("a held pin says why, and how it ends", "pinned" in why and "u" in why)
 
 def test_park_mode(d: str) -> None:
     """Parked rotation must leave a new terminal with nothing at all.

@@ -217,7 +217,7 @@ _DISABLED_YES = ("1", "true", "yes", "y", "x", "on", "disabled")
 #: What a disabled credential reads as: an error that is also a refusal, so every rule skips it.
 DISABLED_R: dict[str, object] = {"err": "disabled", "disabled": True}
 HIST_MAX = 24                           # readings kept per credential for the trend column
-REDACT_TAIL = 32                        # trailing characters of a token the table may show
+REDACT_TAIL = 8                         # trailing characters of a token a message may show
 #: Each utilization field with the reset field beside it and the label used in messages. Pairing
 #: them is what lets a drop be classified: a window that falls while its reset stands still did
 #: not reset.
@@ -1524,11 +1524,13 @@ def needs_rotate(r: dict[str, object], pinned: bool,
                  now: float | None = None) -> tuple[bool, str]:
     """Whether auto-rotate should move off the live credential, and a line saying why (or why not).
 
-    As soon as it is not usable, with one allowance for every live credential, pinned or not:
-    over on the 5h window only, with that window resetting within PIN_GRACE, it is kept until
-    PIN_CEILING, because the quota is about to come back. Rotating it away instead only for
-    rebalance to bring it back after the 5h reset was the commonest swap there was. A spent
-    credential, a weekly overrun, or a reset further off moves it as before.
+    Pinned by hand (`p`): kept past both limits — only a refusal (a spent window, unauthorized,
+    disabled) moves it; its pin also lifts when its week resets, or with `u`.
+
+    Otherwise as soon as it is not usable, with one allowance: over on the 5h window only, with
+    that window resetting within PIN_GRACE, it is kept until PIN_CEILING, because the quota is
+    about to come back. Rotating it away instead only for rebalance to bring it back after the 5h
+    reset was the commonest swap there was. A weekly overrun or a reset further off moves it.
     """
     if usable(r):
         return False, ""
@@ -1540,7 +1542,14 @@ def needs_rotate(r: dict[str, object], pinned: bool,
     why = over_limits(r)
     tag = " — pinned" if pinned else ""
     if not pin_holds(r):
-        return True, why
+        return True, why + (" — pinned, but it is refused now" if pinned else "")
+    if pinned:
+        # A credential pinned by hand is a person's choice, made with the numbers in view: it
+        # stays past both limits. What still moves it is a refusal (above), its week resetting
+        # (the pin lifts then, in auto_swap) or `u` — never a threshold.
+        if p5 is None or p7 is None:
+            return True, f"{why}{tag}, but a window could not be read"
+        return False, "pinned — kept past its limits until it is spent, its week resets, or u"
     if p5 is None or p7 is None:
         return True, f"{why}{tag}, but a window could not be read" if pinned else why
     if p7 >= LIMIT_7D:
@@ -5467,7 +5476,12 @@ def main() -> int:
                         row, p5 = pick
                     at5 = f"{p5:.0f}% of 5h" if p5 is not None else "5h unknown"
                     dest = os.path.basename(creds_path) if file_mode else env_path
-                    ok = ask(keys, f"  switch to '{store.name(row)}' ({at5}) via {dest}? [y/N]: ")
+                    r_p = results.get(store.token(row), {})
+                    past = "" if usable(r_p) else (
+                        f"\n  '{store.name(row)}' is past its limits ({over_limits(r_p)}) — pinned, it "
+                        f"is used until it is spent, its week resets, or u")
+                    ok = ask(keys, f"{past}\n  switch to '{store.name(row)}' ({at5}) via {dest}? "
+                                   f"[y/N]: ")
                     if not ok.lower().startswith("y"):
                         flash = "pin cancelled"
                         continue

@@ -212,23 +212,24 @@ rotation to the limits alone.
 
 ### Pinned credentials
 
-`p` pins the credential you picked; the pin lifts by itself when that credential's week resets,
-or with `u`. Auto-rotate still moves the live credential — pinned or not — with one allowance:
-when its 5h quota is about to come back, it is worth riding out (rotating away only for rebalance
-to bring it back after the 5h reset was the commonest swap of all):
+`p` pins the credential you picked, and **a pin beats the limits**: it is your choice, made with
+the numbers on screen, so auto-rotate keeps it past 61% 5h and past 66% weekly. When the pick is
+already past a limit, `p`'s confirmation says so. Auto-rotate stays on for everything else, and
+still moves off a pinned credential the moment it cannot serve — that safety net is the reason
+not to switch auto-rotate off to force a choice:
 
-| Live credential | Auto-rotate |
-|---|---|
-| under both limits | keeps it |
-| over the 5h limit, window resets **within 1 hour** | keeps it **until 5h reaches 95%** |
-| over the 5h limit, reset **more than 1 hour** away | rotates |
-| over the weekly limit | rotates — the weekly reset is days away |
-| spent (`5h rejected`, `7d rejected`, `EXTRA spent`, unauthorized) | rotates |
+| Live credential | Pinned (`p`) | Not pinned |
+|---|---|---|
+| under both limits | kept | kept |
+| over the 5h limit, 5h resets **within 1 hour** | kept | kept **until 5h reaches 95%** |
+| over the 5h limit, reset **more than 1 hour** away | kept | rotated |
+| over the weekly limit | kept | rotated (unless spent down in off hours) |
+| refused (`5h rejected`, `7d rejected`, unauthorized) or disabled | **rotated, pin lifted** | rotated |
 
-While a pin is being held the footer says so (`held until 95%`), for as long as it holds. Rotating
-away clears the pin. It survives a restart, recorded in `data.json` as a digest, never as the
-token. A spent window is easy to miss — its 429 still carries the quota headers, so the only sign is
-the status — and the pin used to overlook it and hold a spent credential indefinitely.
+The pin also lifts by itself when that credential's week resets, and with `u`. While it holds,
+the footer says so. It survives a restart, recorded in `data.json` as a digest, never as the token.
+A spent window is easy to miss — its 429 still carries the quota headers, so the only sign is the
+status — and that is exactly what lifts the pin.
 
 `p` is also the forced pick in the other sense: choosing "the freshest" from its prompt ignores the
 limits entirely, so it still answers when nothing is usable. Refusing to name one would leave you
