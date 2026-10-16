@@ -90,7 +90,9 @@ binary; libur nasional, not cuti bersama) — and every night from 22:00 to 07:0
 so a weekend runs Friday 22:00 to Monday 07:00 — a credential whose weekly window resets in under
 BURN_WINDOW (7h), with quota left, that no session here carries and whose readings have not moved
 for BURN_IDLE (2h) — so nobody anywhere is on it — is made live with both limits waived — its leftover would be lost at the
-reset otherwise. It is held until the reset or a refusal; a pin outranks it.
+reset otherwise. It is held until the reset or a refusal; a pin outranks it. In working hours
+the limits hold, except for a week resetting in under BURN_WORK_WINDOW (2h): that one is spent down
+by the same rules, since no night reaches a reset at 14:00 on a Tuesday.
 
 When the live credential goes past its limits while a Claude Code session ON THIS MACHINE is still
 running on it, one desktop notification says so, once per crossing. Nothing is interrupted: there
@@ -256,6 +258,11 @@ MIN_HEADROOM = 5.0
 REBALANCE_IDLE = 30 * 60.0
 #: Too close to the reset to be worth two swaps: a spend-down needs at least this long left.
 BURN_MIN = 15 * 60.0
+#: Working hours keep both limits — except for a week about to be lost. A weekly reset at 14:00 on
+#: a Tuesday is out of reach of every night, so in working hours a credential whose week resets in
+#: under BURN_WORK_WINDOW is spent down by the same rules (idle for BURN_IDLE, nobody here on it).
+#: CTR_BURN_WORK_WINDOW (minutes) or --burn-work-window; 0 spends down in off hours only.
+BURN_WORK_WINDOW = 2 * 3600.0
 #: Off hours, local time: every night from NIGHT_FROM to NIGHT_UNTIL counts like a day off — the
 #: working day ends at 17:00, and by 22:00 nobody is on a shared credential for work. So a
 #: weekend runs Friday 22:00 to Monday 07:00. NIGHT_FROM 24 and NIGHT_UNTIL 0 switch nights off.
@@ -3419,6 +3426,7 @@ CONFIG: tuple[tuple[str, object, object], ...] = (
     ("CTR_PIN_CEILING", "float", PIN_CEILING),
     ("CTR_BURN", "bool", True),
     ("CTR_BURN_WINDOW", "float", BURN_WINDOW / 60),
+    ("CTR_BURN_WORK_WINDOW", "float", BURN_WORK_WINDOW / 60),
     ("CTR_BURN_IDLE", "float", BURN_IDLE / 60),
     ("CTR_BURN_MIN", "float", BURN_MIN / 60),
     ("CTR_NIGHT_FROM", "float", NIGHT_FROM),
@@ -3461,6 +3469,8 @@ SETTINGS: dict[str, tuple[str, str, str, float, bool, str]] = {
                  "spend a week down before it resets, in off hours"),
     "CTR_BURN_WINDOW": ("Spend-down", "Window", "min", 60, True,
                         "when its weekly reset is under this far away"),
+    "CTR_BURN_WORK_WINDOW": ("Spend-down", "Work window", "min", 60, True,
+                             "in working hours, under this far away (0: never)"),
     "CTR_BURN_IDLE": ("Spend-down", "Idle", "min", 15, True,
                       "and its readings have not moved for this long"),
     "CTR_BURN_MIN": ("Spend-down", "Min left", "min", 5, True,
@@ -3899,6 +3909,9 @@ def main() -> int:
     ap.add_argument("--burn-window", type=finite, metavar="MIN",
                     help="…when its weekly window resets in under this · CTR_BURN_WINDOW "
                          "(default %(default)s)")
+    ap.add_argument("--burn-work-window", type=finite, metavar="MIN",
+                    help="…and in working hours too, when it resets in under this; 0 waits for "
+                         "off hours · CTR_BURN_WORK_WINDOW (default %(default)s)")
     ap.add_argument("--burn-idle", type=finite, metavar="MIN",
                     help="…and its readings have not moved for this long · CTR_BURN_IDLE "
                          "(default %(default)s)")
@@ -3971,12 +3984,14 @@ def main() -> int:
         if getattr(args, _d, None) != cfg.get(_d):
             sources[_k] = "flag"
     global ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING, BURN_WINDOW, BURN_IDLE, BURN_MIN
+    global BURN_WORK_WINDOW
     global HOLIDAYS_PATH, NIGHT_FROM, NIGHT_UNTIL, REBALANCE_IDLE, MIN_HEADROOM, OFF_LIFT_5H
     ROTATE_GAP = max(0.0, args.rotate_gap)
     RESET_TIE = max(0.0, args.reset_tie) * 60
     PIN_GRACE = max(0.0, args.pin_grace) * 60
     PIN_CEILING = max(1.0, min(101.0, args.pin_ceiling))
     BURN_WINDOW = max(1.0, args.burn_window) * 60
+    BURN_WORK_WINDOW = max(0.0, args.burn_work_window) * 60
     BURN_IDLE = max(0.0, args.burn_idle) * 60
     BURN_MIN = max(0.0, args.burn_min) * 60
     REBALANCE_IDLE = max(0.0, args.rebalance_idle) * 60
@@ -4338,6 +4353,8 @@ def main() -> int:
             _st.pop("burn", None)              # one whose reset has passed: drop the record
             save_state(_st)
         off = day_off(now, load_holidays())
+        # Working hours keep the limits; only a week about to be lost is spent down then.
+        win = BURN_WINDOW if off else BURN_WORK_WINDOW
         # Not while Claude Code is on the /login: nothing would be spent, and `z` back would
         # land on a credential past its limits.
         burn_ok = burn_on and auto_rotate == "on" and bool(LIVE.get("active"))
@@ -4345,7 +4362,7 @@ def main() -> int:
 
         def candidate():
             return burn_pick(store, rows, results, now=now, still=still, live_tok=tok,
-                             holders=lambda t: bool(sessions_on(t)), off=off)
+                             holders=lambda t: bool(sessions_on(t)), off=win > 0, window=win)
 
         def spend(token: str, until_: float) -> None:
             nonlocal burning
@@ -4371,10 +4388,12 @@ def main() -> int:
 
         if burning:
             # Spent down until its weekly reset, past both limits on purpose — only while the rule
-            # is on, auto-rotate is `on`, it is still off hours, and this is still the credential
-            # chosen. A hand-made swap, the reset, a refusal or Monday ends it, and the ordinary
-            # rules take over from there.
-            if burn_ok and burning[0] == pin_id(tok) and burn_holds(cur, burning[1], now, off=off):
+            # is on, auto-rotate is `on`, it is still off hours (or the reset is inside the working
+            # window), and this is still the credential chosen. A hand-made swap, the reset, a
+            # refusal or the working day ends it, and the ordinary rules take over from there.
+            in_time = off or burning[1] - now < BURN_WORK_WINDOW
+            if burn_ok and burning[0] == pin_id(tok) and burn_holds(cur, burning[1], now,
+                                                                    off=in_time):
                 # Soonest reset first holds during a spend-down too: a credential that became
                 # eligible since, and loses its week well before this one, goes first.
                 got = candidate() if gap_ok else None
@@ -4385,14 +4404,14 @@ def main() -> int:
                 return ""
             end_burn()
         is_pinned = bool(pinned) and pinned == pin_id(tok)
-        if burn_ok and not is_pinned and off:
+        if burn_ok and not is_pinned and win > 0:
             # A hand-injected credential is a person's choice and outranks this; nothing else does.
             got = candidate() if gap_ok else None
             # The live credential itself, past its limits with its week about to be lost, is kept
             # rather than rotated away — only for it to come back as an idle candidate later.
             # Also when it is still within its limits but a candidate would otherwise take over:
             # its own week ending sooner is the one to spend, not a later one.
-            keep = burn_left(cur, now) if (got or not usable(cur)) else ""
+            keep = burn_left(cur, now, win) if (got or not usable(cur)) else ""
             mine = ureset(cur, "r7d") if keep else None
             if keep and mine is not None and (not got or mine <= got[2]):
                 spend(tok, mine)
@@ -4768,7 +4787,7 @@ def main() -> int:
         title, mouse) is saved here and applied by the dashboard that asked."""
         nonlocal interval, due, auto_rotate, burn_on, notify_ok
         global LIMIT_5H, LIMIT_7D, ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING
-        global BURN_WINDOW, BURN_IDLE, BURN_MIN, NIGHT_FROM, NIGHT_UNTIL
+        global BURN_WINDOW, BURN_IDLE, BURN_MIN, NIGHT_FROM, NIGHT_UNTIL, BURN_WORK_WINDOW
         global REBALANCE_IDLE, MIN_HEADROOM, HOLIDAYS_PATH, OFF_LIFT_5H
         if key not in SETTINGS:
             return {"ok": False, "msg": f"unknown setting {key}"}
@@ -4795,6 +4814,8 @@ def main() -> int:
             PIN_CEILING = max(1.0, min(101.0, val))
         elif dest == "burn_window":
             BURN_WINDOW = max(1.0, val) * 60
+        elif dest == "burn_work_window":
+            BURN_WORK_WINDOW = max(0.0, val) * 60
         elif dest == "burn_idle":
             BURN_IDLE = max(0.0, val) * 60
         elif dest == "burn_min":

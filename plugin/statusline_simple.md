@@ -1,7 +1,8 @@
 #!/bin/bash
 # Simple one-row status line:
-#   <model> <effort> │ <name> ...<token tail> │ <5h %> <reset in> │ <7d %> <reset in>
-# The two window cells are always in that order, 5h then 7d, so they carry no label.
+#   <model> <effort> │ <name> ...<token tail> │ <5h %> <reset in> │ <7d %> <reset in> │ <context used>/<size> <%>
+# The two window cells are always in that order, 5h then 7d, so they carry no label; the context
+# cell comes last, and reads as the grid's Context cell does.
 #
 # A separate, smaller sibling of statusline_command.md (the 2-row grid), which this
 # leaves alone. Same identity rule as the grid, trimmed: the token comes from the
@@ -76,8 +77,13 @@ fi
 
 # Time to each reset, from the payload's epoch: "45m" under an hour, "3h 20m" under a
 # day, "2d 4h" beyond. A reset already in the past reads "now" until the next render.
-IFS=$'\x1f' read -r p5 p7 r5 r7 model effort _ <<< "$(printf '%s' "$input" | jq -r '
+IFS=$'\x1f' read -r p5 p7 r5 r7 model effort cu cs cp _ <<< "$(printf '%s' "$input" | jq -r '
   def pad2: tostring | if length == 1 then "0" + . else . end;
+  # Token counts, shorter than the grid'\''s: whole thousands ("412k"), a million to 2 decimals ("1M").
+  def tok: if . == null then ""
+           elif . >= 1000000 then "\(((. / 1000000) * 100 | round) / 100)M"
+           elif . >= 1000 then "\(. / 1000 | round)k"
+           else "\(. | round)" end;
   def left: if . == null then "" else ((. - now) | floor) as $s
     | if $s <= 0 then "now"
       elif $s < 3600 then "\($s / 60 | floor)m"
@@ -89,6 +95,9 @@ IFS=$'\x1f' read -r p5 p7 r5 r7 model effort _ <<< "$(printf '%s' "$input" | jq 
     (.rate_limits.seven_day.resets_at | left),
     (.model.display_name // .model.id // ""),
     (.effort.level // ""),
+    ((.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0) | tok),
+    (.context_window.context_window_size | tok),
+    (.context_window.used_percentage | if . == null then "" else (. | round | tostring) end),
     "" ] | join("\u001f")' 2>/dev/null)"
 
 # The model block: name bold cyan, then the effort in gray. Claude Code does
@@ -100,9 +109,10 @@ if [ -n "$model" ]; then
   [ -n "$effort" ] && head="${head} ${DIM}${effort}${RESET}"
 fi
 
+sep=" ${DIM}│${RESET} "
+
 # One cell per window: "59% 1h 20m". A window the payload does not carry is left
 # out, and so is a reset it does not give.
-sep=" ${DIM}│${RESET} "
 cell() { # $1 pct, $2 reset-in
   pct_color "$1"
   REPLY="${REPLY}$1%${RESET}"
@@ -114,5 +124,15 @@ for w in 5h 7d; do
   cell "$p" "$r"
   [ -n "$line" ] && line="${line}${sep}${REPLY}" || line="$REPLY"
 done
+
+# The context cell, last: "412k/1M 41%", the share colored like a window. Left out until the
+# payload carries a percentage (early in a session, and right after a /compact).
+cu="${cu//[^[:print:]]/}"; cs="${cs//[^[:print:]]/}"; cp="${cp//[^0-9]/}"
+if [ -n "$cp" ]; then
+  pct_color "$cp"
+  ctx="${REPLY}${cp}%${RESET}"
+  [ -n "$cs" ] && ctx="${DIM}${cu:-0}/${cs}${RESET} ${ctx}"
+  [ -n "$line" ] && line="${line}${sep}${ctx}" || line="$ctx"
+fi
 [ -n "$head" ] && { [ -n "$line" ] && line="${head}${sep}${line}" || line="$head"; }
 printf '%s\n' "$line"

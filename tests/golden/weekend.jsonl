@@ -22,20 +22,20 @@
 {"burn": null, "live": "Eli", "on": true, "pin": null, "t": "Fri 20:20"}
 {"burn": null, "live": "Eli", "on": true, "pin": null, "t": "Fri 20:30"}
 {"burn": null, "live": "Eli", "on": true, "pin": null, "t": "Fri 20:40"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 20:50"}
-{"on": null, "swap": "Moe", "t": "Fri 20:50"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 21:00"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 21:10"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 21:20"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 21:30"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 21:40"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 21:50"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 22:00"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 22:10"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 22:20"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 22:30"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 22:40"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Fri 22:50"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 20:50"}
+{"on": null, "swap": "Finn", "t": "Fri 20:50"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 21:00"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 21:10"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 21:20"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 21:30"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 21:40"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 21:50"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 22:00"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 22:10"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 22:20"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 22:30"}
+{"burn": "Finn", "live": "Finn", "on": true, "pin": null, "t": "Fri 22:40"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Fri 22:50"}
 {"burn": null, "live": "Eli", "on": true, "pin": null, "t": "Fri 23:00"}
 {"on": null, "swap": "Eli", "t": "Fri 23:00"}
 {"burn": null, "live": "Eli", "on": true, "pin": null, "t": "Fri 23:10"}

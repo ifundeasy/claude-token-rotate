@@ -114,6 +114,41 @@ SCENARIOS: dict[str, dict] = {
                     creds=[("Eli", "D", 10, 30, 3.0, 90.0), ("Moe", "W", 0, 70, 2.0, 5.0),
                            ("Xeno", "X", 0, 53, 2.0, 3.5), ("Finn", "N", 96, 75, 1.0, 6.0)],
                     user=[(at(2026, 10, 10, 8), at(2026, 10, 10, 18))]),
+    # A Monday: a night spend-down whose reset is still 4h off ends at 07:00 and comes back inside
+    # the 2h working-hours window; one somebody is on stays theirs; a later one is spent down too.
+    "workburn": dict(start=at(2026, 10, 12, 5), steps=63, live="Eli",
+                     creds=[("Eli", "D", 10, 30, 3.0, 90.0), ("Xeno", "X", 0, 70, 2.0, 6.0),
+                            ("Ivy", "S", 0, 72, 2.0, 8.0), ("Finn", "N", 0, 75, 2.0, 9.5),
+                            ("Ada", "A", 0, 20, 3.0, 120.0)],
+                     user=[(at(2026, 10, 12, 5), at(2026, 10, 12, 15, 30))],
+                     mate=[("Ivy", at(2026, 10, 12, 10), at(2026, 10, 12, 12), 6, 1)]),
+}
+
+
+# Waste-only scenarios (`--waste`): long runs that measure quota lost at weekly resets, no golden.
+def _day(d, h, mi=0):
+    return at(2026, 10, d, h, mi)
+
+
+WASTE: dict[str, dict] = {
+    # Monday 06:00 to Friday 22:00 with most weekly resets inside working hours; teammates on
+    # their own credentials in the mornings and afternoons, the user on 09-12 and 13-18 and two
+    # evenings.
+    "workweek": dict(start=_day(12, 6), steps=112 * 6, live="Moe",
+                     creds=[("Finn", "N", 0, 60, 2.0, 5.0), ("Moe", "W", 20, 55, 3.0, 10.0),
+                            ("Ivy", "S", 0, 50, 4.0, 28.0), ("Gus", "K", 0, 45, 1.5, 33.0),
+                            ("Ada", "A", 0, 40, 2.5, 51.5), ("Dora", "F", 0, 35, 3.5, 56.0),
+                            ("Nell", "Y", 0, 30, 4.5, 77.0), ("Eli", "D", 0, 25, 1.0, 83.0),
+                            ("Jude", "T", 0, 20, 2.0, 100.0), ("Kit", "B", 0, 15, 3.0, 105.0)],
+                     user=[w for d in range(12, 17) for w in ((_day(d, 9), _day(d, 12)),
+                                                              (_day(d, 13), _day(d, 18)))]
+                          + [(_day(13, 20), _day(13, 23)), (_day(15, 20), _day(15, 23))],
+                     mate=[("Ivy", _day(12, 9), _day(12, 12), 10, 2),
+                           ("Gus", _day(13, 9), _day(13, 11), 10, 2),
+                           ("Ada", _day(13, 13), _day(13, 17), 10, 2),
+                           ("Nell", _day(14, 9), _day(14, 12), 10, 2),
+                           ("Eli", _day(15, 13), _day(15, 16), 10, 2),
+                           ("Jude", _day(16, 9), _day(16, 11), 10, 2)]),
 }
 
 
@@ -128,6 +163,9 @@ class World:
                          "r5": t0 + h5 * H, "r7": t0 + h7 * H}
                   for name, ch, u5, u7, h5, h7 in sc["creds"]}
         self.user, self.mate = sc.get("user", []), sc.get("mate", [])
+        self.rate = sc.get("rate", (15.0, 2.0))               # the user's pp/h on 5h and 7d
+        self.lost: list[tuple[str, float, float]] = []      # (name, when, weekly % unused)
+        self.used = 0.0                                       # weekly points the user spent
 
     def name_of(self, token: str) -> str | None:
         return next((n for n, v in self.c.items() if v["tok"] == token), None)
@@ -138,18 +176,21 @@ class World:
             step = min(M, t1 - t)
             for name, v in self.c.items():
                 r5 = r7 = 0.0
-                if on and name == live and any(a <= t < b for a, b in self.user):
-                    r5, r7 = 15.0, 2.0
+                if on and name == live and any(a <= t < b for a, b in self.user) \
+                        and v["u5"] < 100 and v["u7"] < 100:
+                    r5, r7 = self.rate
+                    self.used += min(r7 * step / H, 100.0 - v["u7"])
                 for mn, a, b, m5, m7 in self.mate:
                     if mn == name and a <= t < b:
                         r5, r7 = r5 + m5, r7 + m7
                 v["u5"] = min(100.0, v["u5"] + r5 * step / H)
                 v["u7"] = min(100.0, v["u7"] + r7 * step / H)
             t += step
-            for v in self.c.values():
+            for name, v in self.c.items():
                 while t >= v["r5"]:
                     v["u5"], v["r5"] = 0.0, v["r5"] + 5 * H
                 while t >= v["r7"]:
+                    self.lost.append((name, v["r7"], 100.0 - v["u7"]))
                     v["u7"], v["r7"] = 0.0, v["r7"] + 7 * 24 * H
 
     def reading(self, name: str) -> dict:
@@ -289,7 +330,7 @@ class Run:
         self.write_world([])
 
     def argv(self) -> list[str]:
-        return (["daemon"] if self.daemon else []) + ["--csv", self.path("token.csv"), "--env-file", self.path("zshenv"),
+        return (["daemon"] if self.daemon else []) + self.sc.get("extra", []) + ["--csv", self.path("token.csv"), "--env-file", self.path("zshenv"),
                 "--creds-file", self.path("creds.json"), "--holidays", self.path("holidays.txt"),
                 "--cap", "off", "--rotate-mode", "on", "--interval", "600",
                 "--no-title", "--no-mouse", "--no-notify", "--sort", "csv"]
@@ -455,6 +496,13 @@ def as_text(lines: list[dict]) -> list[str]:
     return [json.dumps(x, sort_keys=True) for x in lines]
 
 
+def m_day_off(when: float, night_from: float = 20, night_until: float = 7) -> bool:
+    """Off hours as the user's .env has them (nights 20-07, weekends): for labels only."""
+    t = dt.datetime.fromtimestamp(when)
+    h = t.hour + t.minute / 60
+    return t.weekday() >= 5 or h >= night_from or h < night_until
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--code", default=REPO, help="directory holding the main.py to run")
@@ -462,11 +510,37 @@ def main() -> int:
     ap.add_argument("--record", action="store_true", help="write tests/golden from --code")
     ap.add_argument("--golden", action="store_true", help="compare --code against tests/golden")
     ap.add_argument("--show", action="store_true", help="print the timelines")
+    ap.add_argument("--waste", metavar="FLAGS", nargs="?", const="",
+                    help="report quota spent and quota lost at weekly resets, with these extra "
+                         "flags (quoted), instead of comparing timelines")
+    ap.add_argument("--rate", help="with --waste: the user's usage as '5h,7d' pp per hour")
+    ap.add_argument("--detail", action="store_true", help="with --waste: every reset, one per line")
     ap.add_argument("--daemon", action="store_true",
                     help="run each scenario through `daemon` and its socket instead of a screen")
     a = ap.parse_args()
     names = a.only.split(",") if a.only else list(SCENARIOS)
     bad = 0
+    if a.waste is not None:
+        for name in names:
+            sc = {**{**SCENARIOS, **WASTE}[name], "extra": a.waste.split()}
+            if a.rate:
+                sc["rate"] = tuple(float(x) for x in a.rate.split(","))
+            d = tempfile.mkdtemp(prefix=f"ctr-waste-{name}-")
+            try:
+                run = Run(os.path.abspath(a.code), name, sc, d, a.daemon)
+                lines = run.run()
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+            lost = sum(x[2] for x in run.world.lost)
+            swaps = sum(1 for x in lines if "swap" in x)
+            print(f"{name:10} used {run.world.used:6.1f} pts · lost at resets {lost:6.1f} pts "
+                  f"over {len(run.world.lost)} resets · {swaps} swaps")
+            if a.detail:
+                for who, when, left in run.world.lost:
+                    work = "work" if not m_day_off(when) else "off "
+                    print(f"    {who:8} {dt.datetime.fromtimestamp(when):%a %H:%M} {work} "
+                          f"lost {left:5.1f}")
+        return 0
     for name in names:
         lines = as_text(run_scenario(os.path.abspath(a.code), name, a.daemon))
         if a.show:

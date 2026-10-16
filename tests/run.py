@@ -706,6 +706,8 @@ def test_burn_before_weekly_reset(d: str) -> None:
     check("burn: stillness of exactly BURN_IDLE is enough", why(hot, still_since=now - m.BURN_IDLE) != "")
     # The shipped defaults themselves: a 7h window and 2h of stillness (.env.example documents them).
     check("burn defaults: 7h window, 2h idle", m.BURN_WINDOW == 7 * H and m.BURN_IDLE == 2 * H)
+    check("burn defaults: in working hours only within 2h of the reset",
+          m.BURN_WORK_WINDOW == 2 * H)
     check("burn defaults: a reset 6h59m away after 2h of stillness burns",
           m.burn_reason(wk(10, 50, 6 * H + 59 * 60), now=now, still_since=now - 2 * H,
                         on_machine=False, off=True) != "")
