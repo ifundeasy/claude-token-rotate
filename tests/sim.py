@@ -122,6 +122,13 @@ SCENARIOS: dict[str, dict] = {
                             ("Ada", "A", 0, 20, 3.0, 120.0)],
                      user=[(at(2026, 10, 12, 5), at(2026, 10, 12, 15, 30))],
                      mate=[("Ivy", at(2026, 10, 12, 10), at(2026, 10, 12, 12), 6, 1)]),
+    # Pacing: Finn, past 66% but behind its pace (its week ends Tuesday 13:00), is used once its pace
+    # passes it; Moe, a week just begun, is not; nights and the evening do not move a pace.
+    "pace": dict(start=at(2026, 10, 12, 7), steps=29 * 6, live="Eli", extra=[],
+                 creds=[("Eli", "D", 10, 20, 3.0, 120.0), ("Finn", "N", 0, 80, 2.0, 30.0),
+                        ("Moe", "W", 0, 3, 3.0, 167.0), ("Ada", "A", 0, 30, 3.0, 80.0)],
+                 user=[(at(2026, 10, 12, 9), at(2026, 10, 12, 18)),
+                       (at(2026, 10, 13, 9), at(2026, 10, 13, 12))]),
 }
 
 
@@ -152,6 +159,23 @@ WASTE: dict[str, dict] = {
 }
 
 
+def _team() -> dict:
+    """The working week, with every owner on their own credential two hours each working day."""
+    sc = dict(WASTE["workweek"])
+    mates = []
+    for i, (name, *_rest) in enumerate(sc["creds"]):
+        for d in range(12, 17):
+            h = 8 + (i * 37 + d * 13) % 10                # 08:00 to 17:00, spread out
+            mates.append((name, _day(d, h), _day(d, h + 2), 25, 3))
+    sc["mate"] = mates
+    return sc
+
+
+WASTE["team"] = _team()
+# ...owners who need 12 points of their week every working day: 60 of it by Friday.
+WASTE["team_heavy"] = dict(WASTE["team"], mate=[(n, a, b, 25, 6) for n, a, b, _, _ in WASTE["team"]["mate"]])
+
+
 # --------------------------------------------------------------------------- the world
 
 class World:
@@ -166,6 +190,9 @@ class World:
         self.rate = sc.get("rate", (15.0, 2.0))               # the user's pp/h on 5h and 7d
         self.lost: list[tuple[str, float, float]] = []      # (name, when, weekly % unused)
         self.used = 0.0                                       # weekly points the user spent
+        self.mate_hot = 0          # owners who sat down to a 5h window at 61% or more
+        self.mate_low = 0          # ...or to a week at 90% or more
+        self.mate_refused = 0.0    # minutes owners were refused on their own credential
 
     def name_of(self, token: str) -> str | None:
         return next((n for n, v in self.c.items() if v["tok"] == token), None)
@@ -181,8 +208,13 @@ class World:
                     r5, r7 = self.rate
                     self.used += min(r7 * step / H, 100.0 - v["u7"])
                 for mn, a, b, m5, m7 in self.mate:
+                    if mn == name and t <= a < t + step:
+                        self.mate_hot += v["u5"] >= 61
+                        self.mate_low += v["u7"] >= 90
                     if mn == name and a <= t < b:
                         r5, r7 = r5 + m5, r7 + m7
+                        if v["u5"] >= 100 or v["u7"] >= 100:
+                            self.mate_refused += step / 60
                 v["u5"] = min(100.0, v["u5"] + r5 * step / H)
                 v["u7"] = min(100.0, v["u7"] + r7 * step / H)
             t += step
@@ -489,7 +521,9 @@ class Run:
 def run_scenario(code: str, name: str, daemon: bool = False) -> list[dict]:
     d = tempfile.mkdtemp(prefix=f"ctr-sim-{name}-")
     try:
-        return Run(code, name, SCENARIOS[name], d, daemon).run()
+        # The v1 timelines judge the other rules against a fixed weekly limit; `pace` has its own.
+        sc = {"extra": ["--no-pace"], **SCENARIOS[name]}
+        return Run(code, name, sc, d, daemon).run()
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -535,8 +569,10 @@ def main() -> int:
                 shutil.rmtree(d, ignore_errors=True)
             lost = sum(x[2] for x in run.world.lost)
             swaps = sum(1 for x in lines if "swap" in x)
-            print(f"{name:10} used {run.world.used:6.1f} pts · lost at resets {lost:6.1f} pts "
-                  f"over {len(run.world.lost)} resets · {swaps} swaps")
+            w = run.world
+            print(f"{name:10} used {w.used:6.1f} pts · lost at resets {lost:6.1f} pts "
+                  f"over {len(w.lost)} resets · {swaps} swaps · owners: {w.mate_hot} found 5h "
+                  f"≥61%, {w.mate_low} found weekly ≥90%, {w.mate_refused:.0f} min refused")
             if a.detail:
                 for who, when, left in run.world.lost:
                     work = "work" if not m_day_off(when) else "off "

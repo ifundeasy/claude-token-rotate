@@ -53,7 +53,8 @@ THE LIVE CREDENTIAL. One credential is the one Claude Code actually uses, and th
 shows it (cyan in the NAME column) and can change it. `p` pins a chosen token live, `z` switches
 back to your /login and forward again, and `T` cycles what auto-rotate is allowed to do.
 
-    usable      5h < LIMIT_5H (61, so at most 60%)  and  weekly < LIMIT_7D (66)
+    usable      5h < LIMIT_5H (61, so at most 60%)  and  weekly under its PACE — the share of
+                its own week's working time gone by, 100% at its reset (LIMIT_7D, 66, without)
                 — in off hours (weekends, holidays, nights 22:00-07:00) the 5h limit is lifted:
                 5h only has to be unspent (OFF_LIFT_5H); the weekly limit still holds
     trigger     the live credential is not usable
@@ -202,7 +203,7 @@ PROBE_MODEL = "claude-haiku-4-5"        # cheapest model that still returns the 
 API_VERSION = "2023-06-01"
 OAUTH_BETA = "oauth-2025-04-20"         # /v1/messages refuses an OAuth token without it
 UA = "claude-token-rotate/2.0"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 #: The client/daemon protocol. A client that speaks another one runs read-only and says so.
 PROTO = 1
 #: How long the daemon sleeps between looks at the clock, seconds.
@@ -238,6 +239,15 @@ OFF_LIFT_5H = True
 OFF_FORCE: bool | None = None
 _OFF_CACHE: list = [0.0, False]
 LIMIT_7D = 66.0
+#: Pacing: instead of LIMIT_7D, the weekly limit is the share of each credential's week gone by,
+#: counted in working time only (off hours do not count: nobody works then), plus PACE_SLACK
+#: points. Whatever its owner uses counts too, so what is left always covers the working time left
+#: at an even rate — and at the reset the limit is 100%, so nothing is held back that nobody can
+#: use any more. A fixed 66% let a fresh week go two thirds on its first morning and held the last
+#: third back until it was lost. Simulated (tests/sim.py --waste): 30-50% less lost at resets, and
+#: owners refused on their own credential less often, not more. Slack only made that worse.
+PACE = True
+PACE_SLACK = 0.0
 ROTATE_GAP = 15.0                       # seconds between automatic swaps, so nothing thrashes
 #: The slack a PINNED credential gets. When its 5h window resets within PIN_GRACE seconds the quota
 #: is about to come back, so it is kept past the limit — until its 5h reaches PIN_CEILING.
@@ -1508,6 +1518,68 @@ def lim5() -> float:
     return 101.0 if OFF_LIFT_5H and off_now() else LIMIT_5H
 
 
+_HOL_CACHE: list = [0.0, set()]
+_WORK_CACHE: dict = {}
+
+
+def holidays_now() -> set[str]:
+    """holidays.txt, read at most every 30 seconds."""
+    now = time.time()
+    if now - _HOL_CACHE[0] > 30:
+        _HOL_CACHE[:] = [now, load_holidays()]
+    return _HOL_CACHE[1]
+
+
+def work_secs(a: float, b: float) -> float:
+    """Working time (not off hours) between two instants, in 5-minute steps."""
+    hol = holidays_now()
+    key = (int(a // 300), int(b // 300), NIGHT_FROM, NIGHT_UNTIL, len(hol))
+    got = _WORK_CACHE.get(key)
+    if got is None:
+        if len(_WORK_CACHE) > 4096:
+            _WORK_CACHE.clear()
+        got, t = 0.0, a
+        while t < b:
+            step = min(300.0, b - t)
+            if not day_off(t, hol):
+                got += step
+            t += step
+        _WORK_CACHE[key] = got
+    return got
+
+
+def pace(r: dict[str, object], now: float | None = None) -> float | None:
+    """The share of this credential's week gone by, in working time, 0-100; None without a reset.
+
+    The week is the 7 days before its weekly reset. A week with no working time in it at all (a
+    long holiday) counts as gone.
+    """
+    reset = ureset(r, "r7d")
+    if reset is None:
+        return None
+    now = time.time() if now is None else now
+    start = reset - 7 * 86400.0
+    total = work_secs(start, reset)
+    if total <= 0:
+        return 100.0
+    return 100.0 * max(0.0, min(1.0, work_secs(start, min(max(now, start), reset)) / total))
+
+
+def week_rule() -> str:
+    """The weekly limit in words: "weekly 66%", or "weekly past its pace"."""
+    if not PACE:
+        return f"weekly {LIMIT_7D:.0f}%"
+    return "weekly past its pace" + (f" +{PACE_SLACK:.0f}" if PACE_SLACK else "")
+
+
+def lim7(r: dict[str, object]) -> float:
+    """The weekly limit for this credential: its pace plus PACE_SLACK (PACE), else LIMIT_7D."""
+    p = pace(r) if PACE else None
+    if p is None:
+        return LIMIT_7D
+    return max(1.0, min(101.0, p + PACE_SLACK))
+
+
 def usable(r: dict[str, object]) -> bool:
     """Whether a credential may be used: both windows under their limits, and nothing refusing it.
 
@@ -1519,13 +1591,13 @@ def usable(r: dict[str, object]) -> bool:
     if p5 is None or p7 is None or refused(r):
         return False
     # A full window is spent whatever the limits are set to (they go up to 101).
-    return p5 < min(lim5(), 100.0) and p7 < min(LIMIT_7D, 100.0)
+    return p5 < min(lim5(), 100.0) and p7 < min(lim7(r), 100.0)
 
 
 def over_limits(r: dict[str, object]) -> str:
     """Which windows are past their limits, in words for a status line ("5h", "weekly", both)."""
     p5, p7 = upct(r, "u5h"), upct(r, "u7d")
-    over = [w for w, p, lim in (("5h", p5, min(lim5(), 100.0)), ("weekly", p7, LIMIT_7D))
+    over = [w for w, p, lim in (("5h", p5, min(lim5(), 100.0)), ("weekly", p7, lim7(r)))
             if p is not None and p >= lim]
     return " and ".join(over) or state_note(r)
 
@@ -1562,7 +1634,7 @@ def needs_rotate(r: dict[str, object], pinned: bool,
         return False, "pinned — kept past its limits until it is spent, its week resets, or u"
     if p5 is None or p7 is None:
         return True, f"{why}{tag}, but a window could not be read" if pinned else why
-    if p7 >= LIMIT_7D:
+    if p7 >= lim7(r):
         return True, f"{why}{tag}, but the weekly window is past its limit" if pinned else why
     reset = ureset(r, "r5h")
     left = None if reset is None else reset - (time.time() if now is None else now)
@@ -1806,7 +1878,7 @@ def rotate_pick(store: "Store", rows: list[dict[str, str]], results: dict,
             cands.append((p, row))
             p5, p7 = upct(r, "u5h"), upct(r, "u7d")
             if p5 is not None and p7 is not None and p5 <= lim5() - 1 - MIN_HEADROOM \
-                    and p7 <= LIMIT_7D - 1 - MIN_HEADROOM:
+                    and p7 <= lim7(r) - 1 - MIN_HEADROOM:
                 roomy.append((p, row))
     if strict and roomy:
         cands = roomy                       # room to spare first; a tight one only if that is all
@@ -2875,8 +2947,9 @@ def live_note(results: dict, color: bool) -> tuple[str, str, str] | None:
     d = (lambda t: paint(t, DIM, color))
     hi = (lambda t, c=BOLD: paint(t, c, color))
     where = os.path.basename(str(LIVE["path"]))
-    limits = (f" at weekly ≥{LIMIT_7D:.0f}% — 5h limit lifted (off hours)" if lim5() > 100
-              else f" at 5h ≥{LIMIT_5H:.0f}% or weekly ≥{LIMIT_7D:.0f}%")
+    wk = week_rule().replace("weekly ", "weekly ≥", 1) if not PACE else week_rule()
+    limits = (f" at {wk} — 5h limit lifted (off hours)" if lim5() > 100
+              else f" at 5h ≥{LIMIT_5H:.0f}% or {wk}")
     if not LIVE.get("writable"):
         auto = d("auto-swap is off here (--no-env-write)")
     elif LIVE.get("auto") == "on":
@@ -3074,6 +3147,10 @@ def detail_lines(store: Store, row: dict[str, str], r: dict[str, object], still:
             out.append(f"  {label:<7}" + (paint(f"{p:.0f}%", hue(p, color), color) if p is not None
                                            else d("?"))
                        + d(f"   resets in {until(when_)} ({at(when_)})" if when_ else ""))
+        lim = lim7(r)
+        if PACE and lim != LIMIT_7D:
+            out.append(f"  {'limit':<7}" + f"weekly {min(lim, 100.0):.0f}%"
+                       + d("   its pace: that share of its week's working time has gone by"))
         out.append(f"  {'state':<7}{state_note(r)}")
         v = still.get(tok)
         if v:
@@ -3422,6 +3499,8 @@ CONFIG: tuple[tuple[str, object, object], ...] = (
     ("CTR_ROTATE_MODE", ("",) + ROTATE_MODES, ""),
     ("CTR_LIMIT_5H", "float", LIMIT_5H),
     ("CTR_LIMIT_7D", "float", LIMIT_7D),
+    ("CTR_PACE", "bool", PACE),
+    ("CTR_PACE_SLACK", "float", PACE_SLACK),
     ("CTR_OFF_LIFT_5H", "bool", OFF_LIFT_5H),
     ("CTR_ROTATE_GAP", "float", ROTATE_GAP),
     ("CTR_RESET_TIE", "float", RESET_TIE / 60),
@@ -3454,7 +3533,10 @@ SETTINGS: dict[str, tuple[str, str, str, float, bool, str]] = {
     "CTR_LIMIT_5H": ("Rotation", "Limit 5h", "%", 1, True,
                      "usable while 5h is below this (61 = at most 60%)"),
     "CTR_LIMIT_7D": ("Rotation", "Limit weekly", "%", 1, True,
-                     "usable while weekly is below this (66 = at most 65%)"),
+                     "usable while weekly is below this (66 = at most 65%), without pace"),
+    "CTR_PACE": ("Rotation", "Pace weekly", "", 0, True,
+                 "weekly limit = share of its week gone by, in working time"),
+    "CTR_PACE_SLACK": ("Rotation", "Pace slack", "%", 1, True, "points allowed above the pace"),
     "CTR_OFF_LIFT_5H": ("Rotation", "Lift 5h off hours", "", 0, True,
                         "weekends, holidays, nights: use a credential until its 5h is spent"),
     "CTR_MIN_HEADROOM": ("Rotation", "Min headroom", "pts", 1, True,
@@ -3892,6 +3974,12 @@ def main() -> int:
     ap.add_argument("--limit-7d", type=finite, metavar="PCT",
                     help="a credential is usable while its weekly window is below this · "
                          "CTR_LIMIT_7D (default %(default)s)")
+    ap.add_argument("--pace", action=B,
+                    help="the weekly limit is each credential's own pace: the share of its week "
+                         "gone by in working time, 100%% at its reset — CTR_LIMIT_7D only without "
+                         "it · CTR_PACE (default %(default)s)")
+    ap.add_argument("--pace-slack", type=finite, metavar="PCT",
+                    help="…plus this many points · CTR_PACE_SLACK (default %(default)s)")
     ap.add_argument("--off-lift-5h", action=B,
                     help="in off hours (weekends, holidays, nights) the 5h limit is lifted: a "
                          "credential is used until its 5h window is spent · CTR_OFF_LIFT_5H "
@@ -3994,7 +4082,8 @@ def main() -> int:
         if getattr(args, _d, None) != cfg.get(_d):
             sources[_k] = "flag"
     global ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING, BURN_WINDOW, BURN_IDLE, BURN_MIN
-    global BURN_WORK_WINDOW
+    global BURN_WORK_WINDOW, PACE, PACE_SLACK
+    PACE, PACE_SLACK = bool(args.pace), max(0.0, min(100.0, args.pace_slack))
     global HOLIDAYS_PATH, NIGHT_FROM, NIGHT_UNTIL, REBALANCE_IDLE, MIN_HEADROOM, OFF_LIFT_5H
     ROTATE_GAP = max(0.0, args.rotate_gap)
     RESET_TIE = max(0.0, args.reset_tie) * 60
@@ -4482,7 +4571,7 @@ def main() -> int:
             if not no_cand_said:
                 no_cand_said = True
                 return (f"auto-rotate: {LIVE.get('name')} is past its limit ({why}) but no "
-                        f"credential is under 5h {LIMIT_5H:.0f}% and weekly {LIMIT_7D:.0f}% "
+                        f"credential is under 5h {LIMIT_5H:.0f}% and {week_rule()} "
                         f"— staying put")
             return ""
         row, p = pick
@@ -4619,10 +4708,10 @@ def main() -> int:
         elif auto_rotate == "off":
             out = "auto-rotate OFF — the shell file is left alone entirely"
         elif auto_rotate == "park":
-            out = (f"auto-rotate PARK — past 5h {LIMIT_5H:.0f}% or weekly {LIMIT_7D:.0f}% the best "
+            out = (f"auto-rotate PARK — past 5h {LIMIT_5H:.0f}% or {week_rule()} the best "
                    f"credential is recorded switched off · z activates it")
         else:
-            out = f"auto-rotate ON — swaps at 5h {LIMIT_5H:.0f}% or weekly {LIMIT_7D:.0f}%"
+            out = f"auto-rotate ON — swaps at 5h {LIMIT_5H:.0f}% or {week_rule()}"
         return {"ok": True, "msg": out}
 
     def cmd_disable(id_: str) -> dict:
@@ -4800,7 +4889,7 @@ def main() -> int:
         """Change one setting now and save it to .env. A screen-only one (view, sort, colour,
         title, mouse) is saved here and applied by the dashboard that asked."""
         nonlocal interval, due, auto_rotate, burn_on, notify_ok
-        global LIMIT_5H, LIMIT_7D, ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING
+        global LIMIT_5H, LIMIT_7D, ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING, PACE, PACE_SLACK
         global BURN_WINDOW, BURN_IDLE, BURN_MIN, NIGHT_FROM, NIGHT_UNTIL, BURN_WORK_WINDOW
         global REBALANCE_IDLE, MIN_HEADROOM, HOLIDAYS_PATH, OFF_LIFT_5H
         if key not in SETTINGS:
@@ -4818,6 +4907,10 @@ def main() -> int:
             LIMIT_5H = max(1.0, min(101.0, val))
         elif dest == "limit_7d":
             LIMIT_7D = max(1.0, min(101.0, val))
+        elif dest == "pace":
+            PACE = bool(val)
+        elif dest == "pace_slack":
+            PACE_SLACK = max(0.0, min(100.0, val))
         elif dest == "rotate_gap":
             ROTATE_GAP = max(0.0, val)
         elif dest == "reset_tie":
@@ -4902,7 +4995,8 @@ def main() -> int:
                 "globals": {"LIMIT_5H": LIMIT_5H, "LIMIT_7D": LIMIT_7D,
                             "OFF_LIFT_5H": OFF_LIFT_5H, "NIGHT_FROM": NIGHT_FROM,
                             "NIGHT_UNTIL": NIGHT_UNTIL, "CAP_USD": CAP_USD, "POOL": POOL,
-                            "HOLIDAYS_PATH": HOLIDAYS_PATH}}
+                            "HOLIDAYS_PATH": HOLIDAYS_PATH, "PACE": PACE,
+                            "PACE_SLACK": PACE_SLACK}}
 
     def dispatch(req: dict) -> dict:
         c, a = str(req.get("cmd") or ""), req
@@ -5073,7 +5167,8 @@ def main() -> int:
     def pull() -> list[str]:
         nonlocal results, hist, still, pinned, burning, auto_rotate, interval, last, due
         nonlocal probes, env_ok, file_mode, env_path, creds_path, lock
-        global LIMIT_5H, LIMIT_7D, OFF_LIFT_5H, NIGHT_FROM, NIGHT_UNTIL, CAP_USD, POOL
+        global LIMIT_5H, LIMIT_7D, OFF_LIFT_5H, NIGHT_FROM, NIGHT_UNTIL, CAP_USD, POOL, PACE
+        global PACE_SLACK
         global HOLIDAYS_PATH
         snap = client.call("snapshot")
         if not snap.get("ok"):
@@ -5107,6 +5202,7 @@ def main() -> int:
         LIMIT_5H, LIMIT_7D, OFF_LIFT_5H = g["LIMIT_5H"], g["LIMIT_7D"], g["OFF_LIFT_5H"]
         NIGHT_FROM, NIGHT_UNTIL, CAP_USD = g["NIGHT_FROM"], g["NIGHT_UNTIL"], g["CAP_USD"]
         POOL, HOLIDAYS_PATH = g["POOL"] or {}, g["HOLIDAYS_PATH"]
+        PACE, PACE_SLACK = g.get("PACE", PACE), g.get("PACE_SLACK", PACE_SLACK)
         events[:] = snap["events"]
         seen, total = shown.get("ev", None), int(snap.get("ev_total") or 0)
         if seen is not None and total > seen:

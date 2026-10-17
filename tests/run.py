@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main as m                                                        # noqa: E402
 m.OFF_FORCE = False          # working hours unless a test says otherwise: results must not depend
                              # on the day the suite runs (in off hours the 5h limit is lifted)
+m.PACE = False               # the fixed weekly limit, for the same reason; test_pace turns it on
 
 RESULTS: list[tuple[bool, str]] = []
 INHERITED = "sk-ant-oat01-INHERITED-FROM-A-PARENT-PROCESS"
@@ -1524,6 +1525,45 @@ def test_daemon_protocol(d: str) -> None:
           m.Remote(os.path.join(d, "none.sock")).call("hello").get("ok") is False)
 
 
+def test_pace(d: str) -> None:
+    """Pacing: each credential's weekly limit is the share of ITS week gone by, in working time."""
+    at = lambda *a: datetime.datetime(*a).timestamp()                   # noqa: E731
+    saved = m.PACE, m.PACE_SLACK, m.NIGHT_FROM, m.NIGHT_UNTIL, m.HOLIDAYS_PATH
+    try:
+        m.NIGHT_FROM, m.NIGHT_UNTIL = 20.0, 7.0
+        m.HOLIDAYS_PATH = os.path.join(d, "none.txt")
+        m._HOL_CACHE[:] = [0.0, set()]
+        m._WORK_CACHE.clear()
+        r = {"r7d": str(at(2026, 10, 19, 7))}         # week: Monday 07:00 to Monday 07:00
+        check("pace: 0 at the start of its week", m.pace(r, at(2026, 10, 12, 7)) == 0)
+        check("pace: half its working time gone by Wednesday 13:30",
+              abs(m.pace(r, at(2026, 10, 14, 13, 30)) - 50) < 0.5)
+        check("pace: 100 once its last working hour is over (Friday 20:00)",
+              m.pace(r, at(2026, 10, 16, 20)) == 100)
+        r2 = {"r7d": str(at(2026, 10, 20, 12))}       # a week across a weekend, reset Tuesday noon
+        check("pace: a weekend does not move it",
+              m.pace(r2, at(2026, 10, 17, 12)) == m.pace(r2, at(2026, 10, 16, 20)))
+        check("pace: every credential its own (two resets, two paces at the same instant)",
+              m.pace(r, at(2026, 10, 15, 12)) != m.pace(r2, at(2026, 10, 15, 12)))
+        check("pace: none without a weekly reset", m.pace({}, at(2026, 10, 15, 12)) is None)
+        now = time.time()
+        ended = {**reading(10, 99), "r7d": str(now - 1)}
+        fresh = {**reading(10, 2), "r7d": str(now + 7 * 86400 - 1)}
+        m.PACE, m.PACE_SLACK = False, 0.0
+        check("pace off: the fixed limit", m.lim7(ended) == m.LIMIT_7D and not m.usable(ended))
+        m.PACE = True
+        check("pace on: a week at its reset may go to 100%", m.usable(ended))
+        check("pace on: a week just begun is not to be used yet", not m.usable(fresh))
+        m.PACE_SLACK = 5.0
+        check("pace slack: points above the pace", m.usable(fresh) and m.lim7(fresh) >= 5)
+        check("pace: no reset read falls back to the fixed limit",
+              m.lim7(reading(10, 50)) == m.LIMIT_7D)
+    finally:
+        m.PACE, m.PACE_SLACK, m.NIGHT_FROM, m.NIGHT_UNTIL, m.HOLIDAYS_PATH = saved
+        m._HOL_CACHE[:] = [0.0, set()]
+        m._WORK_CACHE.clear()
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
@@ -1534,7 +1574,7 @@ def main() -> int:
                    test_park_mode,
                    test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
                    test_file_mode, test_header_sort, test_burn_before_weekly_reset, test_holiday_file,
-                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle, test_idle_and_nights_hold, test_fewer_swaps, test_disabled_is_never_used, test_off_hours_lift_5h, test_daemon_protocol):
+                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle, test_idle_and_nights_hold, test_fewer_swaps, test_disabled_is_never_used, test_off_hours_lift_5h, test_pace, test_daemon_protocol):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

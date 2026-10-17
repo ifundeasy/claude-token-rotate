@@ -169,7 +169,7 @@ carried the variable). This is **file mode**, the default.
 ### The limits
 
 ```
-usable      5h < 61%  (at most 60%)   and   weekly < 66%
+usable      5h < 61%  (at most 60%)   and   weekly under its pace (each credential its own)
 trigger     the live credential is not usable, and 15s have passed since the last swap
             (checked after every refresh — `--interval`, default 60s)
 choose      among the usable ones, the soonest weekly reset;
@@ -180,8 +180,21 @@ choose      among the usable ones, the soonest weekly reset;
 national holiday, or any night from 22:00 to 07:00 — consecutive days off run together, so a
 two-day holiday is one stretch from 22:00 the evening before to 07:00 the morning after — a
 credential stays live until its 5h window is actually spent, and a replacement only needs 5h
-left. The weekly limit (66) still applies. Back in working hours the 5h limit returns, and a live
+left. The weekly limit (its pace) still applies. Back in working hours the 5h limit returns, and a live
 credential past it moves on as usual. The footer says when the lift is in force.
+
+**The weekly limit is each credential's pace** (`CTR_PACE`, on by default). A credential's week is
+the 7 days before its own weekly reset, and its limit is the share of that week's **working time**
+gone by — nights, weekends and holidays do not count, since nobody works then. Its owner's use
+counts too, so what is left always covers the working time left at an even rate; and at the reset
+the limit is 100%, so nothing is held back that nobody can use any more. A week that just began
+cannot be used yet, one about to reset can be used up, and each credential is somewhere between on
+its own clock. The detail panel (`Enter`) shows the limit in force. A fixed 66% let a fresh week go
+two thirds on its first morning and held the last third back until it was lost: simulated
+(`tests/sim.py --waste`), pacing lost 30–50% less at the resets of a working week with owners on
+their credentials, and those owners were refused on their own credential less often. Points of
+slack above the pace (`CTR_PACE_SLACK`) only ate into an owner's last day. `CTR_PACE=false` goes
+back to `CTR_LIMIT_7D`.
 
 **Both windows decide.** A credential at 4% of its five hours and 96% of its week is fresh by the
 five-hour number alone and refused on the next request, so each window is checked on its own. The
@@ -639,7 +652,9 @@ where it came from — a typo cannot silently do nothing. Relative paths are tak
 | `CTR_NOTIFY` | `--[no-]notify` | `true` | desktop notification when the live credential is past its limits and still in use |
 | `CTR_ROTATE_MODE` | `--rotate-mode off\|park\|on` | last `T` | what auto-rotate may do (`--auto-rotate` = `on`) |
 | `CTR_LIMIT_5H` | `--limit-5h PCT` | `61` | usable while 5h is below this (at most 60%) |
-| `CTR_LIMIT_7D` | `--limit-7d PCT` | `66` | usable while weekly is below this (at most 65%) |
+| `CTR_LIMIT_7D` | `--limit-7d PCT` | `66` | usable while weekly is below this (at most 65%), without pace |
+| `CTR_PACE` | `--[no-]pace` | `true` | the weekly limit is each credential's pace: the share of its week's working time gone by |
+| `CTR_PACE_SLACK` | `--pace-slack PCT` | `0` | …plus this many points |
 | `CTR_OFF_LIFT_5H` | `--[no-]off-lift-5h` | `true` | in off hours (weekends, holidays, nights 22:00–07:00) the 5h limit is lifted — used until 5h is spent; weekly still holds |
 | `CTR_ROTATE_GAP` | `--rotate-gap SEC` | `15` | least time between two automatic swaps |
 | `CTR_RESET_TIE` | `--reset-tie MIN` | `60` | weekly resets this close tie, and the 5h reset decides |
