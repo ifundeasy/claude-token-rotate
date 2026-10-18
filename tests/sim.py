@@ -18,6 +18,7 @@ live, and waits for the dashboard to redraw before it reads the result.
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import difflib
 import json
@@ -123,7 +124,7 @@ SCENARIOS: dict[str, dict] = {
                      user=[(at(2026, 10, 12, 5), at(2026, 10, 12, 15, 30))],
                      mate=[("Ivy", at(2026, 10, 12, 10), at(2026, 10, 12, 12), 6, 1)]),
     # Pacing: Finn, past 66% but behind its pace (its week ends Tuesday 13:00), is used once its pace
-    # passes it; Moe, a week just begun, is not; nights and the evening do not move a pace.
+    # passes it; a week just begun has its slack; nights and the evening do not move a pace.
     "pace": dict(start=at(2026, 10, 12, 7), steps=29 * 6, live="Eli", extra=[],
                  creds=[("Eli", "D", 10, 20, 3.0, 120.0), ("Finn", "N", 0, 80, 2.0, 30.0),
                         ("Moe", "W", 0, 3, 3.0, 167.0), ("Ada", "A", 0, 30, 3.0, 80.0)],
@@ -187,6 +188,15 @@ WASTE["weekend_owners"] = dict(SCENARIOS["weekend"], mate=[
     ("Ada", _d(10, 13), _d(10, 16), 25, 3), ("Kit", _d(10, 21), _d(10, 23), 25, 3),
     ("Dora", _d(11, 10), _d(11, 13), 25, 3), ("Nell", _d(11, 15), _d(11, 18), 25, 3),
     ("Jude", _d(11, 20), _d(11, 22), 25, 3)])
+# A Sunday with every older week past its pace and four weeks that began over the weekend.
+WASTE["sunday"] = dict(start=_d(18, 7), steps=26 * 6, live="Moe",
+                       creds=[("Moe", "W", 0, 74, 2.0, 52.0), ("Cal", "C", 0, 69, 2.0, 64.0),
+                              ("Eli", "D", 0, 55, 2.0, 81.0), ("Nell", "Y", 0, 96, 2.0, 27.0),
+                              ("Finn", "N", 0, 1, 3.0, 142.0), ("Ivy", "S", 0, 1, 3.0, 150.0),
+                              ("Gus", "K", 0, 1, 3.0, 152.0), ("Ada", "A", 0, 0, 3.0, 168.0)],
+                       user=[(_d(18, 9), _d(18, 12)), (_d(18, 14), _d(18, 18)),
+                             (_d(18, 20), _d(18, 23)), (_d(19, 8), _d(19, 9))],
+                       mate=[("Moe", _d(19, 8), _d(19, 9), 25, 3), ("Cal", _d(19, 8), _d(19, 9), 25, 3)])
 # ...owners who need 12 points of their week every working day: 60 of it by Friday.
 WASTE["team_heavy"] = dict(WASTE["team"], mate=[(n, a, b, 25, 6) for n, a, b, _, _ in WASTE["team"]["mate"]])
 
@@ -595,9 +605,11 @@ def main() -> int:
             lost = sum(x[2] for x in run.world.lost)
             swaps = sum(1 for x in lines if "swap" in x)
             w = run.world
+            live = collections.Counter(x["live"] for x in lines if x.get("live"))
             print(f"{name:10} used {w.used:6.1f} pts · lost at resets {lost:6.1f} pts "
                   f"over {len(w.lost)} resets · {swaps} swaps · owners: {w.mate_hot} found 5h "
                   f"≥61%, {w.mate_low} found weekly ≥90%, {w.mate_refused:.0f} min refused")
+            print("    live (refreshes):", ", ".join(f"{n} {c}" for n, c in live.most_common()))
             if a.detail:
                 for who, when, left in run.world.lost:
                     work = "work" if not m_day_off(when) else "off "

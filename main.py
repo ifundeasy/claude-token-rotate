@@ -203,7 +203,7 @@ PROBE_MODEL = "claude-haiku-4-5"        # cheapest model that still returns the 
 API_VERSION = "2023-06-01"
 OAUTH_BETA = "oauth-2025-04-20"         # /v1/messages refuses an OAuth token without it
 UA = "claude-token-rotate/2.0"
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 #: The client/daemon protocol. A client that speaks another one runs read-only and says so.
 PROTO = 1
 #: How long the daemon sleeps between looks at the clock, seconds.
@@ -245,9 +245,11 @@ LIMIT_7D = 66.0
 #: at an even rate — and at the reset the limit is 100%, so nothing is held back that nobody can
 #: use any more. A fixed 66% let a fresh week go two thirds on its first morning and held the last
 #: third back until it was lost. Simulated (tests/sim.py --waste): 30-50% less lost at resets, and
-#: owners refused on their own credential less often, not more. Slack only made that worse.
+#: owners refused on their own credential less often, not more. PACE_SLACK points are allowed on
+#: top at the start of a week, shrinking to none at its reset (see lim7): a week that began on a
+#: weekend has no working time behind it until Monday, and must not sit unusable all weekend.
 PACE = True
-PACE_SLACK = 0.0
+PACE_SLACK = 20.0
 #: Somebody else on the live credential: its readings rose while every Claude Code process here
 #: that could be using it sat idle (under FOREIGN_CPU of a core: idle reads under 0.8 s a minute,
 #: waiting on the API 2-3 s, streaming 20+), on two refreshes running. Its owner is at work — on a
@@ -1601,19 +1603,25 @@ def pace(r: dict[str, object], now: float | None = None) -> float | None:
     return 100.0 * max(0.0, min(1.0, work_secs(start, min(max(now, start), reset)) / total))
 
 
-def week_rule() -> str:
-    """The weekly limit in words: "weekly 66%", or "weekly past its pace"."""
+def week_rule(within: bool = False) -> str:
+    """The weekly limit in words: "weekly 66%", or "weekly past its pace" ("within" with within)."""
     if not PACE:
         return f"weekly {LIMIT_7D:.0f}%"
-    return "weekly past its pace" + (f" +{PACE_SLACK:.0f}" if PACE_SLACK else "")
+    return f"weekly {'within' if within else 'past'} its pace"
 
 
 def lim7(r: dict[str, object]) -> float:
-    """The weekly limit for this credential: its pace plus PACE_SLACK (PACE), else LIMIT_7D."""
+    """The weekly limit for this credential: its pace plus slack (PACE), else LIMIT_7D.
+
+    The slack is PACE_SLACK at the start of the week and shrinks with the pace to none at the
+    reset: a week that began on a Saturday has no working time behind it all weekend, and a pace
+    of 0 would leave it unusable until Monday with all of it still ahead — while slack that lasts
+    to the end eats into the owner's last day.
+    """
     p = pace(r) if PACE else None
     if p is None:
         return LIMIT_7D
-    return max(1.0, min(101.0, p + PACE_SLACK))
+    return max(1.0, min(101.0, p + PACE_SLACK * (1 - p / 100)))
 
 
 def usable(r: dict[str, object]) -> bool:
@@ -3573,7 +3581,8 @@ SETTINGS: dict[str, tuple[str, str, str, float, bool, str]] = {
                      "usable while weekly is below this (66 = at most 65%), without pace"),
     "CTR_PACE": ("Rotation", "Pace weekly", "", 0, True,
                  "weekly limit = share of its week gone by, in working time"),
-    "CTR_PACE_SLACK": ("Rotation", "Pace slack", "%", 1, True, "points allowed above the pace"),
+    "CTR_PACE_SLACK": ("Rotation", "Pace slack", "%", 1, True,
+                       "points above the pace at a week's start, none at its reset"),
     "CTR_FOREIGN": ("Rotation", "Leave to owner", "", 0, True,
                     "move off a live one somebody else is using"),
     "CTR_OFF_LIFT_5H": ("Rotation", "Lift 5h off hours", "", 0, True,
@@ -4018,7 +4027,8 @@ def main() -> int:
                          "gone by in working time, 100%% at its reset — CTR_LIMIT_7D only without "
                          "it · CTR_PACE (default %(default)s)")
     ap.add_argument("--pace-slack", type=finite, metavar="PCT",
-                    help="…plus this many points · CTR_PACE_SLACK (default %(default)s)")
+                    help="…plus this many points at the start of a week, shrinking to none at its "
+                         "reset · CTR_PACE_SLACK (default %(default)s)")
     ap.add_argument("--foreign", action=B,
                     help="move off the live credential when somebody else is on it — it rose while "
                          "Claude Code here was idle — and leave it alone until idle again · "
@@ -4675,7 +4685,7 @@ def main() -> int:
             if not no_cand_said:
                 no_cand_said = True
                 return (f"auto-rotate: {LIVE.get('name')} is past its limit ({why}) but no "
-                        f"credential is under 5h {LIMIT_5H:.0f}% and {week_rule()} "
+                        f"credential is under 5h {LIMIT_5H:.0f}% and {week_rule(within=True)} "
                         f"— staying put")
             return ""
         row, p = pick

@@ -1554,8 +1554,12 @@ def test_pace(d: str) -> None:
         m.PACE = True
         check("pace on: a week at its reset may go to 100%", m.usable(ended))
         check("pace on: a week just begun is not to be used yet", not m.usable(fresh))
-        m.PACE_SLACK = 5.0
-        check("pace slack: points above the pace", m.usable(fresh) and m.lim7(fresh) >= 5)
+        m.PACE_SLACK = 20.0
+        check("pace slack: a week just begun has its slack, weekend or not",
+              m.usable(fresh) and abs(m.lim7(fresh) - 20) < 1)
+        check("pace slack: none left at the reset", m.lim7(ended) == 100)
+        check("pace: the 'nothing usable' line says within, not past",
+              m.week_rule(within=True) == "weekly within its pace")
         check("pace: no reset read falls back to the fixed limit",
               m.lim7(reading(10, 50)) == m.LIMIT_7D)
     finally:

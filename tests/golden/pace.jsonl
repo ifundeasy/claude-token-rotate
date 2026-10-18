@@ -1,9 +1,9 @@
-{"burn": null, "live": "Eli", "on": true, "pin": null, "t": "Mon 07:00"}
-{"burn": null, "live": "Eli", "on": true, "pin": null, "t": "Mon 07:10"}
-{"burn": null, "live": "Eli", "on": true, "pin": null, "t": "Mon 07:20"}
-{"burn": null, "live": "Eli", "on": true, "pin": null, "t": "Mon 07:30"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 07:00"}
+{"on": null, "swap": "Ada", "t": "Mon 07:00"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 07:10"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 07:20"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 07:30"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 07:40"}
-{"on": null, "swap": "Ada", "t": "Mon 07:40"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 07:50"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 08:00"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 08:10"}
@@ -33,42 +33,36 @@
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 12:10"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 12:20"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 12:30"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Mon 12:40"}
-{"on": null, "swap": "Moe", "t": "Mon 12:40"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 12:40"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 12:50"}
-{"on": null, "swap": "Ada", "t": "Mon 12:50"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 13:00"}
-{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 13:10"}
-{"on": null, "swap": "Finn", "t": "Mon 13:10"}
-{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 13:20"}
-{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 13:30"}
-{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 13:40"}
-{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 13:50"}
-{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 14:00"}
-{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 14:10"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Mon 14:20"}
-{"on": null, "swap": "Moe", "t": "Mon 14:20"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 13:10"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 13:20"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 13:30"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 13:40"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 13:50"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 14:00"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 14:10"}
+{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 14:20"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 14:30"}
-{"on": null, "swap": "Ada", "t": "Mon 14:30"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 14:40"}
 {"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 14:50"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 15:00"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 15:10"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 15:20"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 15:30"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 15:40"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 15:50"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 16:00"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 16:10"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 16:20"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 16:30"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 16:40"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 16:50"}
-{"burn": null, "live": "Ada", "on": true, "pin": null, "t": "Mon 17:00"}
-{"burn": null, "live": "Moe", "on": true, "pin": null, "t": "Mon 17:10"}
-{"on": null, "swap": "Moe", "t": "Mon 17:10"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 15:00"}
+{"on": null, "swap": "Finn", "t": "Mon 15:00"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 15:10"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 15:20"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 15:30"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 15:40"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 15:50"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 16:00"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 16:10"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 16:20"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 16:30"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 16:40"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 16:50"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 17:00"}
+{"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 17:10"}
 {"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 17:20"}
-{"on": null, "swap": "Finn", "t": "Mon 17:20"}
 {"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 17:30"}
 {"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 17:40"}
 {"burn": null, "live": "Finn", "on": true, "pin": null, "t": "Mon 17:50"}

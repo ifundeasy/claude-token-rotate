@@ -187,14 +187,16 @@ credential past it moves on as usual. The footer says when the lift is in force.
 the 7 days before its own weekly reset, and its limit is the share of that week's **working time**
 gone by — nights, weekends and holidays do not count, since nobody works then. Its owner's use
 counts too, so what is left always covers the working time left at an even rate; and at the reset
-the limit is 100%, so nothing is held back that nobody can use any more. A week that just began
-cannot be used yet, one about to reset can be used up, and each credential is somewhere between on
-its own clock. The detail panel (`Enter`) shows the limit in force. A fixed 66% let a fresh week go
+the limit is 100%, so nothing is held back that nobody can use any more. On top of it, a week gets
+20 points at its start (`CTR_PACE_SLACK`), shrinking to none at its reset: a week that began on a
+Saturday has no working time behind it until Monday, and without them it sat unusable all weekend
+with all of it ahead. A week about to reset can be used up, and each credential is somewhere
+between on its own clock. The detail panel (`Enter`) shows the limit in force. A fixed 66% let a fresh week go
 two thirds on its first morning and held the last third back until it was lost: simulated
 (`tests/sim.py --waste`), pacing lost 30–50% less at the resets of a working week with owners on
-their credentials, and those owners were refused on their own credential less often. Points of
-slack above the pace (`CTR_PACE_SLACK`) only ate into an owner's last day. `CTR_PACE=false` goes
-back to `CTR_LIMIT_7D`.
+their credentials, and those owners were refused on their own credential less often. Slack that
+lasted to the reset ate into an owner's last day; the shrinking kind does not. `CTR_PACE=false`
+goes back to `CTR_LIMIT_7D`.
 
 **A credential somebody else is on is left to them** (`CTR_FOREIGN`, on by default). The live
 credential's readings rising while every Claude Code process here that could use it sits idle —
@@ -665,7 +667,7 @@ where it came from — a typo cannot silently do nothing. Relative paths are tak
 | `CTR_LIMIT_5H` | `--limit-5h PCT` | `61` | usable while 5h is below this (at most 60%) |
 | `CTR_LIMIT_7D` | `--limit-7d PCT` | `66` | usable while weekly is below this (at most 65%), without pace |
 | `CTR_PACE` | `--[no-]pace` | `true` | the weekly limit is each credential's pace: the share of its week's working time gone by |
-| `CTR_PACE_SLACK` | `--pace-slack PCT` | `0` | …plus this many points |
+| `CTR_PACE_SLACK` | `--pace-slack PCT` | `20` | …plus this many points at a week's start, none at its reset |
 | `CTR_FOREIGN` | `--[no-]foreign` | `true` | move off a live credential somebody else is using, and leave it alone until idle |
 | `CTR_OFF_LIFT_5H` | `--[no-]off-lift-5h` | `true` | in off hours (weekends, holidays, nights 22:00–07:00) the 5h limit is lifted — used until 5h is spent; weekly still holds |
 | `CTR_ROTATE_GAP` | `--rotate-gap SEC` | `15` | least time between two automatic swaps |
