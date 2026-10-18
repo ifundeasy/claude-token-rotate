@@ -129,6 +129,14 @@ SCENARIOS: dict[str, dict] = {
                         ("Moe", "W", 0, 3, 3.0, 167.0), ("Ada", "A", 0, 30, 3.0, 80.0)],
                  user=[(at(2026, 10, 12, 9), at(2026, 10, 12, 18)),
                        (at(2026, 10, 13, 9), at(2026, 10, 13, 12))]),
+    # Saturday: Lux, resetting tonight, is spent down until its owner sits down at noon while the
+    # user is away — then it is left to them, and taken up again once idle for two hours.
+    "foreign": dict(start=at(2026, 10, 17, 8), steps=10 * 6, live="Dora", extra=[],
+                    creds=[("Dora", "D", 10, 20, 3.0, 120.0), ("Lux", "L", 0, 70, 2.0, 12.0),
+                           ("Ada", "A", 0, 30, 3.0, 100.0)],
+                    user=[(at(2026, 10, 17, 9), at(2026, 10, 17, 11, 30)),
+                          (at(2026, 10, 17, 14, 30), at(2026, 10, 17, 17))],
+                    mate=[("Lux", at(2026, 10, 17, 12), at(2026, 10, 17, 14), 25, 3)]),
 }
 
 
@@ -172,6 +180,13 @@ def _team() -> dict:
 
 
 WASTE["team"] = _team()
+# The weekend, with owners at work on their own credentials on Saturday and Sunday.
+_d = lambda d, h, mi=0: at(2026, 10, d, h, mi)                          # noqa: E731
+WASTE["weekend_owners"] = dict(SCENARIOS["weekend"], mate=[
+    ("Gus", _d(10, 7), _d(10, 8, 30), 25, 3), ("Eli", _d(10, 10), _d(10, 12), 25, 3),
+    ("Ada", _d(10, 13), _d(10, 16), 25, 3), ("Kit", _d(10, 21), _d(10, 23), 25, 3),
+    ("Dora", _d(11, 10), _d(11, 13), 25, 3), ("Nell", _d(11, 15), _d(11, 18), 25, 3),
+    ("Jude", _d(11, 20), _d(11, 22), 25, 3)])
 # ...owners who need 12 points of their week every working day: 60 of it by Friday.
 WASTE["team_heavy"] = dict(WASTE["team"], mate=[(n, a, b, 25, 6) for n, a, b, _, _ in WASTE["team"]["mate"]])
 
@@ -193,6 +208,7 @@ class World:
         self.mate_hot = 0          # owners who sat down to a 5h window at 61% or more
         self.mate_low = 0          # ...or to a week at 90% or more
         self.mate_refused = 0.0    # minutes owners were refused on their own credential
+        self.cpu = 0.0             # CPU seconds of the user's Claude Code: 20 a minute at work
 
     def name_of(self, token: str) -> str | None:
         return next((n for n, v in self.c.items() if v["tok"] == token), None)
@@ -201,6 +217,8 @@ class World:
         t = t0
         while t < t1:
             step = min(M, t1 - t)
+            if any(a <= t < b for a, b in self.user):
+                self.cpu += 20 * step / 60
             for name, v in self.c.items():
                 r5 = r7 = 0.0
                 if on and name == live and any(a <= t < b for a, b in self.user) \
@@ -280,6 +298,12 @@ def child(code: str, d: str, argv: list[str]) -> None:
     m.refresh_pool = lambda timeout: None
     m.resolve_cap = lambda *a, **k: None
     m.sessions_on = lambda token: []
+
+    def claude_cpu(token):                       # the user's sessions: busy while they work
+        with open(world_p) as fh:
+            return {4242: json.load(fh).get("_cpu", 0.0)}
+
+    m.claude_cpu = claude_cpu
     m.notify = lambda *a, **k: False
     real_apply = m.apply_live
 
@@ -330,6 +354,7 @@ class Run:
     def write_world(self, blips: list[str]) -> None:
         w = {v["tok"]: ({"err": "timed out"} if n in blips else self.world.reading(n))
              for n, v in self.world.c.items()}
+        w["_cpu"] = self.world.cpu
         with open(self.path("world.json"), "w") as fh:
             json.dump(w, fh)
 
@@ -522,7 +547,7 @@ def run_scenario(code: str, name: str, daemon: bool = False) -> list[dict]:
     d = tempfile.mkdtemp(prefix=f"ctr-sim-{name}-")
     try:
         # The v1 timelines judge the other rules against a fixed weekly limit; `pace` has its own.
-        sc = {"extra": ["--no-pace"], **SCENARIOS[name]}
+        sc = {"extra": ["--no-pace", "--no-foreign"], **SCENARIOS[name]}
         return Run(code, name, sc, d, daemon).run()
     finally:
         shutil.rmtree(d, ignore_errors=True)

@@ -196,6 +196,17 @@ their credentials, and those owners were refused on their own credential less of
 slack above the pace (`CTR_PACE_SLACK`) only ate into an owner's last day. `CTR_PACE=false` goes
 back to `CTR_LIMIT_7D`.
 
+**A credential somebody else is on is left to them** (`CTR_FOREIGN`, on by default). The live
+credential's readings rising while every Claude Code process here that could use it sits idle —
+under 1.5 s of CPU a minute; waiting on the API takes 2–3, streaming 20 or more — on two refreshes
+running means its owner is at work, on a weekend too. Auto-rotate moves off it (a pin stays, with a
+note), a spend-down on it ends, and nothing picks it again until it has been idle for 2 hours. While
+anything else will do, rotation also skips a credential whose readings moved in the last 30
+minutes. It cannot see an owner on it at the same moment as you, and it cannot know in advance
+that one will come: a week spent down on Saturday morning is not there for an owner who sits down
+in the afternoon. Simulated weekend with owners at work (`tests/sim.py --waste`, `weekend_owners`):
+owners refused 180 minutes instead of 203.
+
 **Both windows decide.** A credential at 4% of its five hours and 96% of its week is fresh by the
 five-hour number alone and refused on the next request, so each window is checked on its own. The
 weekly limit is flat — no weekend or working-day arithmetic. `--limit-5h` and `--limit-7d` move
@@ -655,6 +666,7 @@ where it came from — a typo cannot silently do nothing. Relative paths are tak
 | `CTR_LIMIT_7D` | `--limit-7d PCT` | `66` | usable while weekly is below this (at most 65%), without pace |
 | `CTR_PACE` | `--[no-]pace` | `true` | the weekly limit is each credential's pace: the share of its week's working time gone by |
 | `CTR_PACE_SLACK` | `--pace-slack PCT` | `0` | …plus this many points |
+| `CTR_FOREIGN` | `--[no-]foreign` | `true` | move off a live credential somebody else is using, and leave it alone until idle |
 | `CTR_OFF_LIFT_5H` | `--[no-]off-lift-5h` | `true` | in off hours (weekends, holidays, nights 22:00–07:00) the 5h limit is lifted — used until 5h is spent; weekly still holds |
 | `CTR_ROTATE_GAP` | `--rotate-gap SEC` | `15` | least time between two automatic swaps |
 | `CTR_RESET_TIE` | `--reset-tie MIN` | `60` | weekly resets this close tie, and the 5h reset decides |

@@ -1564,6 +1564,15 @@ def test_pace(d: str) -> None:
         m._WORK_CACHE.clear()
 
 
+def test_foreign(d: str) -> None:
+    """Somebody else on the live credential: the local Claude Code CPU it is judged against."""
+    got = m.claude_cpu("sk-ant-oat01-NOT-A-REAL-TOKEN")
+    check("claude_cpu: a map of pid to CPU seconds, never this process",
+          isinstance(got, dict) and os.getpid() not in got
+          and all(isinstance(v, float) and v >= 0 for v in got.values()))
+    check("foreign: on by default", ("CTR_FOREIGN", "bool", True) in m.CONFIG)
+
+
 def main() -> int:
     d = tempfile.mkdtemp(prefix="ctr-tests-")
     try:
@@ -1574,7 +1583,7 @@ def main() -> int:
                    test_park_mode,
                    test_creds_follow, test_statusline_account, test_pin_lifts_when_spent,
                    test_file_mode, test_header_sort, test_burn_before_weekly_reset, test_holiday_file,
-                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle, test_idle_and_nights_hold, test_fewer_swaps, test_disabled_is_never_used, test_off_hours_lift_5h, test_pace, test_daemon_protocol):
+                   test_config, test_rules_do_not_leak, test_burn_does_not_leak, test_one_writer_and_prompts_time_out, test_burn_refinements, test_eve_counts_as_off, test_unseen_counts_as_idle, test_idle_and_nights_hold, test_fewer_swaps, test_disabled_is_never_used, test_off_hours_lift_5h, test_pace, test_foreign, test_daemon_protocol):
             fn(d)
     finally:
         shutil.rmtree(d, ignore_errors=True)

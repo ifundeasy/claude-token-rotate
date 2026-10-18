@@ -203,7 +203,7 @@ PROBE_MODEL = "claude-haiku-4-5"        # cheapest model that still returns the 
 API_VERSION = "2023-06-01"
 OAUTH_BETA = "oauth-2025-04-20"         # /v1/messages refuses an OAuth token without it
 UA = "claude-token-rotate/2.0"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 #: The client/daemon protocol. A client that speaks another one runs read-only and says so.
 PROTO = 1
 #: How long the daemon sleeps between looks at the clock, seconds.
@@ -248,6 +248,13 @@ LIMIT_7D = 66.0
 #: owners refused on their own credential less often, not more. Slack only made that worse.
 PACE = True
 PACE_SLACK = 0.0
+#: Somebody else on the live credential: its readings rose while every Claude Code process here
+#: that could be using it sat idle (under FOREIGN_CPU of a core: idle reads under 0.8 s a minute,
+#: waiting on the API 2-3 s, streaming 20+), on two refreshes running. Its owner is at work — on a
+#: weekend too — so this machine moves off it and leaves it alone until it has been idle again.
+#: Two refreshes, because one rise can still be the tail of our own last request.
+FOREIGN = True
+FOREIGN_CPU = 0.025
 ROTATE_GAP = 15.0                       # seconds between automatic swaps, so nothing thrashes
 #: The slack a PINNED credential gets. When its 5h window resets within PIN_GRACE seconds the quota
 #: is about to come back, so it is kept past the limit — until its 5h reaches PIN_CEILING.
@@ -1459,6 +1466,35 @@ def sessions_on(token: str) -> list[tuple[int, str]]:
             continue                      # the process went away, or is not ours to read
         out.append((int(entry), (cmd or exe)[:60]))
     return sorted(out)
+
+
+def claude_cpu(token: str) -> dict[int, float]:
+    """CPU seconds so far of each Claude Code process here that may be using `token`.
+
+    One that carries another token in its environment is not using this one; one that carries
+    none reads the credentials file, which is the live credential. Empty without /proc.
+    """
+    if not os.path.isdir("/proc"):
+        return {}
+    tick = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    mine = {os.getpid(), os.getppid()}
+    out: dict[int, float] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) in mine:
+            continue
+        try:
+            if not CLAUDE_EXE_RE.match(os.path.basename(os.readlink(f"/proc/{entry}/exe"))):
+                continue
+            env = open(f"/proc/{entry}/environ", "rb").read().split(b"\0")
+            carried = next((e[len(b"CLAUDE_CODE_OAUTH_TOKEN="):] for e in env
+                            if e.startswith(b"CLAUDE_CODE_OAUTH_TOKEN=")), None)
+            if carried and carried.decode(errors="replace") != token:
+                continue
+            f = open(f"/proc/{entry}/stat").read().rsplit(")", 1)[1].split()
+            out[int(entry)] = (int(f[11]) + int(f[12])) / tick
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
 
 
 def notify(title: str, body: str) -> bool:
@@ -3501,6 +3537,7 @@ CONFIG: tuple[tuple[str, object, object], ...] = (
     ("CTR_LIMIT_7D", "float", LIMIT_7D),
     ("CTR_PACE", "bool", PACE),
     ("CTR_PACE_SLACK", "float", PACE_SLACK),
+    ("CTR_FOREIGN", "bool", FOREIGN),
     ("CTR_OFF_LIFT_5H", "bool", OFF_LIFT_5H),
     ("CTR_ROTATE_GAP", "float", ROTATE_GAP),
     ("CTR_RESET_TIE", "float", RESET_TIE / 60),
@@ -3537,6 +3574,8 @@ SETTINGS: dict[str, tuple[str, str, str, float, bool, str]] = {
     "CTR_PACE": ("Rotation", "Pace weekly", "", 0, True,
                  "weekly limit = share of its week gone by, in working time"),
     "CTR_PACE_SLACK": ("Rotation", "Pace slack", "%", 1, True, "points allowed above the pace"),
+    "CTR_FOREIGN": ("Rotation", "Leave to owner", "", 0, True,
+                    "move off a live one somebody else is using"),
     "CTR_OFF_LIFT_5H": ("Rotation", "Lift 5h off hours", "", 0, True,
                         "weekends, holidays, nights: use a credential until its 5h is spent"),
     "CTR_MIN_HEADROOM": ("Rotation", "Min headroom", "pts", 1, True,
@@ -3980,6 +4019,10 @@ def main() -> int:
                          "it · CTR_PACE (default %(default)s)")
     ap.add_argument("--pace-slack", type=finite, metavar="PCT",
                     help="…plus this many points · CTR_PACE_SLACK (default %(default)s)")
+    ap.add_argument("--foreign", action=B,
+                    help="move off the live credential when somebody else is on it — it rose while "
+                         "Claude Code here was idle — and leave it alone until idle again · "
+                         "CTR_FOREIGN (default %(default)s)")
     ap.add_argument("--off-lift-5h", action=B,
                     help="in off hours (weekends, holidays, nights) the 5h limit is lifted: a "
                          "credential is used until its 5h window is spent · CTR_OFF_LIFT_5H "
@@ -4082,8 +4125,9 @@ def main() -> int:
         if getattr(args, _d, None) != cfg.get(_d):
             sources[_k] = "flag"
     global ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING, BURN_WINDOW, BURN_IDLE, BURN_MIN
-    global BURN_WORK_WINDOW, PACE, PACE_SLACK
+    global BURN_WORK_WINDOW, PACE, PACE_SLACK, FOREIGN
     PACE, PACE_SLACK = bool(args.pace), max(0.0, min(100.0, args.pace_slack))
+    FOREIGN = bool(args.foreign)
     global HOLIDAYS_PATH, NIGHT_FROM, NIGHT_UNTIL, REBALANCE_IDLE, MIN_HEADROOM, OFF_LIFT_5H
     ROTATE_GAP = max(0.0, args.rotate_gap)
     RESET_TIE = max(0.0, args.reset_tie) * 60
@@ -4203,6 +4247,11 @@ def main() -> int:
     #: credential is live by then, and live is exactly what the idle test would hold against it.
     burning = burn_record(_st0, time.time())
     burn_on = args.burn
+    #: The live credential's last readings and the local Claude Code CPU beside them, how many
+    #: refreshes in a row it rose with nobody here busy, and when each token was last caught in use
+    #: by somebody else.
+    foreign_watch: dict = {"last": None, "runs": 0}
+    foreign_at: dict[str, float] = {}
     #: Since when each credential's readings have stood still: ((5h, 7d), since).
     still: dict[str, tuple[tuple[float, float], float, float]] = {}
     # The clock survives a restart: a credential seen moving still waits, one seen standing still
@@ -4381,6 +4430,18 @@ def main() -> int:
         if _st.pop("burn", None) is not None:
             save_state(_st)
 
+    def in_use(token: str, now: float) -> bool:
+        """Somebody is on it: its readings moved within REBALANCE_IDLE — or within BURN_IDLE, for
+        one caught in use while it was live here (this machine's own use does not move the clock).
+        """
+        v = still.get(token)
+        since = v[1] if v is not None else -1e18
+        if token in foreign_at:
+            if now - since < BURN_IDLE:
+                return True
+            foreign_at.pop(token, None)                     # idle again: an ordinary candidate
+        return now - since < REBALANCE_IDLE
+
     def auto_swap(results: dict, rows: list[dict[str, str]]) -> str:
         """Swap in a usable credential when the live one is not. Returns a status line or "".
 
@@ -4462,6 +4523,43 @@ def main() -> int:
         # land on a credential past its limits.
         burn_ok = burn_on and auto_rotate == "on" and bool(LIVE.get("active"))
         gap_ok = now - last_rotate >= ROTATE_GAP
+        if FOREIGN and LIVE.get("active"):
+            seen = claude_cpu(tok)
+            c5, c7 = upct(cur, "u5h"), upct(cur, "u7d")
+            prev, foreign_watch["last"] = foreign_watch["last"], (tok, c5, c7, seen, now)
+            hit = False
+            if (prev and prev[0] == tok and now > prev[4]
+                    and None not in (c5, c7, prev[1], prev[2])):
+                rose = c5 > prev[1] or c7 > prev[2]
+                gone = any(pid not in seen for pid in prev[3])      # one ended: it may have spent
+                busy = any(cpu - prev[3].get(pid, 0.0) > FOREIGN_CPU * (now - prev[4])
+                           for pid, cpu in seen.items())
+                hit = rose and not gone and not busy
+            foreign_watch["runs"] = foreign_watch["runs"] + 1 if hit else 0
+            if foreign_watch["runs"] >= 2:
+                foreign_watch["runs"] = 0
+                foreign_at[tok] = now
+                still[tok] = ((c5, c7), now, now)       # in use: idle tests wait from now
+                old = LIVE.get("name")
+                if burning and burning[0] == pin_id(tok):
+                    end_burn()
+                if pinned and pinned == pin_id(tok):
+                    LIVE["held"] = "pinned — somebody else is on it too"
+                    return f"⚠ somebody else is on {old} (it moved while Claude Code here was idle) — pinned, kept"
+                quiet = [r_ for r_ in rows if not in_use(store.token(r_), now)]
+                pick = rotate_pick(store, quiet, results, exclude=tok, strict=True)
+                if pick is None:
+                    return (f"⚠ somebody else is on {old} (it moved while Claude Code here was "
+                            f"idle) — nothing else is usable, staying")
+                try:
+                    msg = go_live(store.token(pick[0]), False if auto_rotate == "park" else None)
+                except (RuntimeError, OSError) as exc:
+                    auto_rotate = "off"
+                    read_live()
+                    return f"auto-rotate OFF — write failed: {exc}"
+                last_rotate, no_cand_said = now, False
+                return (f"↻ somebody else is on {old} (it moved while Claude Code here was idle) "
+                        f"→ {store.name(pick[0])}; left alone until idle again · {msg}")
 
         def candidate():
             return burn_pick(store, rows, results, now=now, still=still, live_tok=tok,
@@ -4543,7 +4641,8 @@ def main() -> int:
             if (args.rebalance and auto_rotate == "on" and not is_pinned and gap_ok
                     and LIVE.get("active") and not why and not blind and not sessions_on(tok)):
                 quiet = [r_ for r_ in rows
-                         if now - (still.get(store.token(r_)) or (None, now))[1] >= REBALANCE_IDLE]
+                         if now - (still.get(store.token(r_)) or (None, now))[1] >= REBALANCE_IDLE
+                         and not (FOREIGN and in_use(store.token(r_), now))]
                 pick = rotate_pick(store, quiet, results, exclude=tok, strict=True)
                 if pick is not None:
                     row, p = pick
@@ -4566,7 +4665,12 @@ def main() -> int:
             return ""
         if time.time() - last_rotate < ROTATE_GAP:
             return ""
-        pick = rotate_pick(store, rows, results, exclude=tok, strict=True)
+        # Not onto one somebody is on right now, while anything else will do.
+        pick = None
+        if FOREIGN:
+            pick = rotate_pick(store, [r_ for r_ in rows if not in_use(store.token(r_), now)],
+                               results, exclude=tok, strict=True)
+        pick = pick or rotate_pick(store, rows, results, exclude=tok, strict=True)
         if pick is None:
             if not no_cand_said:
                 no_cand_said = True
@@ -4890,6 +4994,7 @@ def main() -> int:
         title, mouse) is saved here and applied by the dashboard that asked."""
         nonlocal interval, due, auto_rotate, burn_on, notify_ok
         global LIMIT_5H, LIMIT_7D, ROTATE_GAP, RESET_TIE, PIN_GRACE, PIN_CEILING, PACE, PACE_SLACK
+        global FOREIGN
         global BURN_WINDOW, BURN_IDLE, BURN_MIN, NIGHT_FROM, NIGHT_UNTIL, BURN_WORK_WINDOW
         global REBALANCE_IDLE, MIN_HEADROOM, HOLIDAYS_PATH, OFF_LIFT_5H
         if key not in SETTINGS:
@@ -4911,6 +5016,8 @@ def main() -> int:
             PACE = bool(val)
         elif dest == "pace_slack":
             PACE_SLACK = max(0.0, min(100.0, val))
+        elif dest == "foreign":
+            FOREIGN = bool(val)
         elif dest == "rotate_gap":
             ROTATE_GAP = max(0.0, val)
         elif dest == "reset_tie":
